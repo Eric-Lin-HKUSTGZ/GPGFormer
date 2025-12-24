@@ -1,0 +1,5 @@
+checkpoints
+pretrained_model
+mano_data
+logs
+*.log
