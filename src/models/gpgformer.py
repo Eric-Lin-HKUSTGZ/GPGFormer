@@ -180,8 +180,11 @@ class GPGFormer(nn.Module):
                 global_orient = rotmats[:, 0:1]
                 hand_pose = rotmats[:, 1:]
             mano_out = self.mano(global_orient=global_orient, hand_pose=hand_pose, betas=pred_shape)
-            output["pred_vertices"] = mano_out.vertices
-            output["pred_joints"] = mano_out.joints
+            pred_vertices_m = mano_out.vertices
+            pred_joints_m = mano_out.joints
+            output["pred_vertices"] = pred_vertices_m * 1000.0
+            output["pred_joints"] = pred_joints_m * 1000.0
+            output["pred_cam_t"] = pred_cam_t
 
             if cam_param is not None:
                 fx = cam_param[:, 0]
@@ -204,7 +207,7 @@ class GPGFormer(nn.Module):
                 ).unsqueeze(0).repeat(B, 1)
 
             pred_joints_2d = perspective_projection(
-                output["pred_joints"],
+                pred_joints_m,
                 translation=pred_cam_t,
                 focal_length=focal_length,
                 camera_center=camera_center,

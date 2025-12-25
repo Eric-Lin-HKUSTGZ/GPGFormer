@@ -858,13 +858,14 @@ class HO3DDataset(Dataset):
                 'betas': np.array([1.0], dtype=np.float32)
             }
             flip_perm = list(range(21))
-            img_patch, keypoints_2d, keypoints_3d, aug_mano_params, _, _ = get_example(
+            img_patch, keypoints_2d, keypoints_3d, aug_mano_params, _, _, trans = get_example(
                 rgb, center[0], center[1], scale[0], scale[1],
                 keypoints_2d, keypoints_3d, mano_params, has_mano_params,
                 flip_perm, self.img_size, self.img_size,
                 self.mean, self.std,
                 do_augment=self.train, is_right=True,
-                augm_config=self.wilor_aug_config, is_bgr=True
+                augm_config=self.wilor_aug_config, is_bgr=True,
+                return_trans=True
             )
             joints_3d_np = keypoints_3d[:, :3].astype(np.float32)
             mano_pose = np.concatenate(
@@ -872,6 +873,14 @@ class HO3DDataset(Dataset):
                 axis=0
             ).astype(np.float32)
             mano_shape = aug_mano_params['betas'].astype(np.float32)
+            trans_3x3 = np.eye(3, dtype=np.float32)
+            trans_3x3[:2, :] = trans
+            K = np.array(
+                [[cam_para[0], 0.0, cam_para[2]], [0.0, cam_para[1], cam_para[3]], [0.0, 0.0, 1.0]],
+                dtype=np.float32,
+            )
+            K_patch = trans_3x3 @ K
+            cam_para = (K_patch[0, 0], K_patch[1, 1], K_patch[0, 2], K_patch[1, 2])
             data_depth = torch.zeros((1, self.img_size, self.img_size), dtype=torch.float32)
             return {
                 'rgb': torch.from_numpy(img_patch).float(),

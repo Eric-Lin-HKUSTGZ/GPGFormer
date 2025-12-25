@@ -41,13 +41,13 @@ mano:
 
 training:
   num_epochs: 50
-  batch_size: 16
+  batch_size: 24
   num_workers: 8
   save_dir: "./checkpoints/freihand"
   log_dir: "./logs/freihand"
   save_freq: 10
-  test_freq: 5
-  val_split_ratio: 0.1
+  test_freq: 1
+  # val_split_ratio: 0.1
   log_freq: 50
 
 optimizer:
@@ -78,10 +78,10 @@ augmentation:
   wilor_color_scale: 0.2
 
 loss:
-  w_pose: 1.0
+  w_pose: 0.1
   w_shape: 0.1
-  w_cam: 1.0
-  w_2d: 0.01
+  w_cam: 0.0005
+  w_2d: 1.0
   w_3d_joint: 0.05
 
 runtime:

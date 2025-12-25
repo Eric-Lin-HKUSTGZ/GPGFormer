@@ -47,7 +47,7 @@ training:
   save_dir: "./checkpoints/dexycb"
   log_dir: "./logs/dexycb"
   save_freq: 10
-  test_freq: 5
+  test_freq: 1
   val_split_ratio: 0.0
   log_freq: 50
 

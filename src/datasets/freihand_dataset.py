@@ -124,7 +124,8 @@ class FreiHANDDataset(Dataset):
         mano_params = np.array(self.mano_list[idx][0], dtype=np.float32)
         mano_pose = mano_params[:48]
         mano_shape = mano_params[48:58]
-        mano_trans = mano_params[58:61]
+        # FreiHAND mano_trans is in millimeters; convert to meters to match MANO output space.
+        mano_trans = mano_params[58:61] / 1000.0
 
         # 2D projection (original image coordinates)
         joint_uv = _project_points(joints_xyz / 1000.0, K)  # use meters for projection
@@ -153,7 +154,7 @@ class FreiHANDDataset(Dataset):
                 'betas': np.array([1.0], dtype=np.float32)
             }
             flip_perm = list(range(21))
-            img_patch, keypoints_2d, keypoints_3d, mano_params, _has_params, _ = get_example(
+            img_patch, keypoints_2d, keypoints_3d, mano_params, _has_params, _, trans = get_example(
                 rgb, center[0], center[1], scale[0], scale[1],
                 keypoints_2d, keypoints_3d,
                 mano_params, has_mano_params,
@@ -161,11 +162,21 @@ class FreiHANDDataset(Dataset):
                 self.mean, self.std,
                 do_augment=self.train, is_right=True,
                 augm_config=self.wilor_aug_config,
-                is_bgr=True
+                is_bgr=True,
+                return_trans=True
             )
             imgRGB = torch.from_numpy(img_patch).float()
             joint_img = keypoints_2d.astype(np.float32)
             joints_xyz = keypoints_3d[:, :3].astype(np.float32)
+            mano_pose = np.concatenate(
+                [mano_params['global_orient'], mano_params['hand_pose']],
+                axis=0
+            ).astype(np.float32)
+            mano_shape = mano_params['betas'].astype(np.float32)
+            trans_3x3 = np.eye(3, dtype=np.float32)
+            trans_3x3[:2, :] = trans
+            K_patch = trans_3x3 @ K
+            cam_para = (K_patch[0, 0], K_patch[1, 1], K_patch[0, 2], K_patch[1, 2])
         else:
             # Resize to model input and apply simple color augmentation
             if H0 != self.img_size or W0 != self.img_size:

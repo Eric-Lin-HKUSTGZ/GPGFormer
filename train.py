@@ -20,6 +20,69 @@ from src.models.gpgformer import GPGFormer
 from src.losses.loss import GPGFormerLoss
 from src.utils.detector import HandDetector
 
+def _compute_similarity_transform(S1: torch.Tensor, S2: torch.Tensor) -> torch.Tensor:
+    S1 = S1.permute(0, 2, 1)
+    S2 = S2.permute(0, 2, 1)
+    mu1 = S1.mean(dim=-1, keepdim=True)
+    mu2 = S2.mean(dim=-1, keepdim=True)
+    X1 = S1 - mu1
+    X2 = S2 - mu2
+    var1 = (X1 ** 2).sum(dim=(1, 2))
+    K = torch.matmul(X1, X2.transpose(1, 2))
+    U, _, V = torch.svd(K)
+    Z = torch.eye(3, device=S1.device).unsqueeze(0).repeat(S1.shape[0], 1, 1)
+    det = torch.det(torch.matmul(V, U.transpose(1, 2)))
+    Z[:, 2, 2] = torch.sign(det)
+    R = torch.matmul(torch.matmul(V, Z), U.transpose(1, 2))
+    trace = torch.matmul(R, K).diagonal(offset=0, dim1=-1, dim2=-2).sum(dim=-1)
+    scale = (trace / var1).unsqueeze(dim=-1).unsqueeze(dim=-1)
+    t = mu2 - scale * torch.matmul(R, mu1)
+    S1_hat = scale * torch.matmul(R, S1) + t
+    return S1_hat.permute(0, 2, 1)
+
+
+def compute_mpjpe(pred_joints: torch.Tensor, gt_joints: torch.Tensor) -> np.ndarray:
+    if pred_joints.dim() == 2:
+        pred_joints = pred_joints.unsqueeze(0)
+        gt_joints = gt_joints.unsqueeze(0)
+        squeeze_output = True
+    else:
+        squeeze_output = False
+    pred_joints = torch.where(torch.isfinite(pred_joints), pred_joints, torch.zeros_like(pred_joints))
+    gt_joints = torch.where(torch.isfinite(gt_joints), gt_joints, torch.zeros_like(gt_joints))
+    var_gt = gt_joints.var(dim=(1, 2))
+    valid_mask = var_gt > 1e-8
+    if not valid_mask.any():
+        zeros = torch.zeros((pred_joints.shape[0],), device=pred_joints.device)
+        out = zeros.cpu().numpy()
+        return out[0] if squeeze_output else out
+    joint_errors = torch.sqrt(torch.clamp(((pred_joints - gt_joints) ** 2).sum(dim=-1), min=1e-12))
+    mpjpe = joint_errors.mean(dim=-1)
+    mpjpe_mm = mpjpe.cpu().numpy()
+    return mpjpe_mm[0] if squeeze_output else mpjpe_mm
+
+
+def compute_pa_mpjpe(pred_joints: torch.Tensor, gt_joints: torch.Tensor) -> np.ndarray:
+    if pred_joints.dim() == 2:
+        pred_joints = pred_joints.unsqueeze(0)
+        gt_joints = gt_joints.unsqueeze(0)
+        squeeze_output = True
+    else:
+        squeeze_output = False
+    pred_joints = torch.where(torch.isfinite(pred_joints), pred_joints, torch.zeros_like(pred_joints))
+    gt_joints = torch.where(torch.isfinite(gt_joints), gt_joints, torch.zeros_like(gt_joints))
+    var_gt = gt_joints.var(dim=(1, 2))
+    valid_mask = var_gt > 1e-8
+    if not valid_mask.any():
+        zeros = torch.zeros((pred_joints.shape[0],), device=pred_joints.device)
+        out = zeros.cpu().numpy()
+        return out[0] if squeeze_output else out
+    pred_joints_aligned = _compute_similarity_transform(pred_joints, gt_joints)
+    joint_errors = torch.sqrt(torch.clamp(((pred_joints_aligned - gt_joints) ** 2).sum(dim=-1), min=1e-12))
+    pa_mpjpe = joint_errors.mean(dim=-1)
+    pa_mpjpe_mm = pa_mpjpe.cpu().numpy()
+    return pa_mpjpe_mm[0] if squeeze_output else pa_mpjpe_mm
+
 
 def load_config(path: str) -> dict:
     with open(path, "r") as f:
@@ -66,6 +129,67 @@ def _build_wilor_aug_config(config: dict) -> dict:
         "EXTREME_CROP_AUG_RATE": aug_cfg.get("wilor_extreme_crop_aug_rate", 0.0),
         "COLOR_SCALE": aug_cfg.get("wilor_color_scale", 0.2),
     }
+
+
+def _compute_loss_breakdown(criterion: GPGFormerLoss, preds: dict, targets: dict) -> dict:
+    breakdown = {
+        "loss_pose": 0.0,
+        "loss_shape": 0.0,
+        "loss_cam": 0.0,
+        "loss_joints_2d": 0.0,
+        "loss_joints_3d": 0.0,
+        "total_loss": 0.0,
+    }
+
+    if targets.get("mano_pose") is not None:
+        has_pose = targets.get("has_mano_pose")
+        if has_pose is None:
+            has_pose = criterion._has_param(targets["mano_pose"])
+        loss_pose = criterion.param_loss(preds["pred_pose"], targets["mano_pose"], has_pose)
+        breakdown["loss_pose"] = (criterion.w_pose * loss_pose).item()
+
+    if targets.get("mano_shape") is not None:
+        has_shape = targets.get("has_mano_shape")
+        if has_shape is None:
+            has_shape = criterion._has_param(targets["mano_shape"])
+        loss_shape = criterion.param_loss(preds["pred_shape"], targets["mano_shape"], has_shape)
+        breakdown["loss_shape"] = (criterion.w_shape * loss_shape).item()
+
+    if targets.get("cam_t") is not None:
+        has_cam = targets.get("has_cam_t")
+        if has_cam is None:
+            has_cam = criterion._has_param(targets["cam_t"])
+        loss_cam = criterion.param_loss(preds["pred_cam_t"], targets["cam_t"], has_cam)
+        breakdown["loss_cam"] = (criterion.w_cam * loss_cam).item()
+
+    if criterion.w_joints_3d > 0 and preds.get("pred_joints") is not None and targets.get("joints_3d_gt") is not None:
+        gt_joints = targets["joints_3d_gt"]
+        if gt_joints.dim() == 3 and gt_joints.shape[-1] == 3:
+            conf = torch.ones_like(gt_joints[..., :1])
+            gt_joints = torch.cat([gt_joints, conf], dim=-1)
+        loss_3d = criterion.kp3d_loss(preds["pred_joints"], gt_joints)
+        breakdown["loss_joints_3d"] = (criterion.w_joints_3d * loss_3d).item()
+
+    if criterion.w_joints_2d > 0 and preds.get("pred_joints_2d") is not None and targets.get("joints_2d") is not None:
+        gt_2d = targets["joints_2d"]
+        if gt_2d.dim() == 3 and gt_2d.shape[-1] == 2:
+            conf = torch.ones_like(gt_2d[..., :1])
+            gt_2d = torch.cat([gt_2d, conf], dim=-1)
+        loss_2d = criterion.kp2d_loss(preds["pred_joints_2d"], gt_2d)
+        breakdown["loss_joints_2d"] = (criterion.w_joints_2d * loss_2d).item()
+
+    breakdown["total_loss"] = (
+        breakdown["loss_pose"]
+        + breakdown["loss_shape"]
+        + breakdown["loss_cam"]
+        + breakdown["loss_joints_2d"]
+        + breakdown["loss_joints_3d"]
+    )
+    return breakdown
+
+
+def _strip_moge_from_state_dict(state_dict: dict) -> dict:
+    return {k: v for k, v in state_dict.items() if not k.startswith("moge.")}
 
 
 def create_dataloader(config: dict, split: str = "train", distributed: bool = False,
@@ -222,6 +346,166 @@ def create_scheduler(optimizer: torch.optim.Optimizer, config: dict):
     return None
 
 
+def test(model: nn.Module, dataloader: DataLoader, criterion: nn.Module, device: torch.device,
+         epoch: int, writer: Optional[SummaryWriter], rank: int, distributed: bool,
+         detector: Optional[HandDetector]) -> dict:
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0
+    all_pred_keypoints = []
+    all_gt_keypoints = []
+
+    if distributed and hasattr(dataloader.sampler, "set_epoch"):
+        dataloader.sampler.set_epoch(epoch)
+
+    with torch.no_grad():
+        pbar = tqdm(dataloader, desc=f"Val {epoch}", disable=(rank != 0))
+        for batch in pbar:
+            rgb = batch["rgb"].to(device)
+            bboxes = batch.get("bbox")
+            if bboxes is None and detector is not None and "image_bgr" in batch:
+                box_list = []
+                for img in batch["image_bgr"]:
+                    img_np = img.detach().cpu().numpy() if isinstance(img, torch.Tensor) else img
+                    dets = detector.detect(img_np)
+                    h, w = img_np.shape[:2]
+                    box_list.append(dets[0] if dets else [0, 0, w - 1, h - 1])
+                bboxes = torch.tensor(box_list, dtype=torch.float32, device=device)
+            if bboxes is None:
+                bboxes = torch.tensor(
+                    [[0, 0, rgb.shape[-1] - 1, rgb.shape[-2] - 1]] * rgb.shape[0],
+                    dtype=torch.float32,
+                    device=device,
+                )
+            else:
+                bboxes = bboxes.to(device)
+
+            cam_param = batch.get("cam_param")
+            if cam_param is not None:
+                cam_param = cam_param.to(device)
+            preds = model(rgb, bboxes, cam_param=cam_param)
+
+            cam_t = batch.get("cam_t")
+            if cam_t is None and "mano_trans" in batch:
+                cam_t = batch.get("mano_trans")
+            joints_2d = None
+            if "joint_img" in batch:
+                joint_img = batch["joint_img"].to(device)
+                if joint_img.dim() == 3:
+                    conf = torch.ones_like(joint_img[..., :1])
+                    joints_2d = torch.cat([joint_img[..., :2], conf], dim=-1)
+
+            targets = {
+                "mano_pose": batch.get("mano_pose").to(device) if "mano_pose" in batch else None,
+                "mano_shape": batch.get("mano_shape").to(device) if "mano_shape" in batch else None,
+                "cam_t": cam_t.to(device) if cam_t is not None else None,
+                "joints_3d_gt": batch.get("joints_3d_gt").to(device) if "joints_3d_gt" in batch else None,
+                "joints_2d": joints_2d,
+            }
+
+            loss = criterion(preds, targets)
+            total_loss += float(loss)
+            num_batches += 1
+
+            if preds.get("pred_joints") is not None and targets.get("joints_3d_gt") is not None:
+                all_pred_keypoints.append(preds["pred_joints"].detach().cpu())
+                all_gt_keypoints.append(targets["joints_3d_gt"].detach().cpu())
+
+    if distributed:
+        loss_tensor = torch.tensor(total_loss / max(num_batches, 1), device=device)
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+        avg_loss = (loss_tensor / dist.get_world_size()).item()
+    else:
+        avg_loss = total_loss / max(num_batches, 1)
+
+    metrics_dict = {
+        "test_loss": avg_loss,
+        "mpjpe": float("inf"),
+        "pa_mpjpe": float("inf"),
+        "avg_metric": float("inf"),
+    }
+
+    if not all_pred_keypoints or not all_gt_keypoints:
+        return metrics_dict
+
+    if distributed:
+        local_pred = torch.cat(all_pred_keypoints, dim=0)
+        local_gt = torch.cat(all_gt_keypoints, dim=0)
+        world_size = dist.get_world_size()
+        local_size = torch.tensor([local_pred.shape[0]], dtype=torch.long, device=device)
+        size_list = [torch.zeros(1, dtype=torch.long, device=device) for _ in range(world_size)]
+        dist.all_gather(size_list, local_size)
+        if rank == 0:
+            all_preds_list = []
+            all_gts_list = []
+            for i, size in enumerate(size_list):
+                num_samples = size.item()
+                if i == rank:
+                    all_preds_list.append(local_pred.cpu())
+                    all_gts_list.append(local_gt.cpu())
+                else:
+                    recv_pred = torch.zeros(
+                        num_samples,
+                        local_pred.shape[1],
+                        local_pred.shape[2],
+                        dtype=local_pred.dtype,
+                        device=device,
+                    )
+                    recv_gt = torch.zeros(
+                        num_samples,
+                        local_gt.shape[1],
+                        local_gt.shape[2],
+                        dtype=local_gt.dtype,
+                        device=device,
+                    )
+                    dist.recv(recv_pred, src=i)
+                    dist.recv(recv_gt, src=i)
+                    all_preds_list.append(recv_pred.cpu())
+                    all_gts_list.append(recv_gt.cpu())
+            all_pred = torch.cat(all_preds_list, dim=0)
+            all_gt = torch.cat(all_gts_list, dim=0)
+        else:
+            dist.send(local_pred.to(device), dst=0)
+            dist.send(local_gt.to(device), dst=0)
+            return metrics_dict
+    else:
+        all_pred = torch.cat(all_pred_keypoints, dim=0)
+        all_gt = torch.cat(all_gt_keypoints, dim=0)
+
+    all_pred_centered = all_pred - all_pred[:, [0], :]
+    all_gt_centered = all_gt - all_gt[:, [0], :]
+    gt_var = all_gt_centered.var(dim=(1, 2))
+    finite_mask = torch.isfinite(all_gt_centered).all(dim=(1, 2))
+    valid_mask = (gt_var > 1e-8) & finite_mask
+    if valid_mask.any():
+        all_pred_valid = all_pred_centered[valid_mask].to(device)
+        all_gt_valid = all_gt_centered[valid_mask].to(device)
+        mpjpe_array = compute_mpjpe(all_pred_valid, all_gt_valid)
+        pa_mpjpe_array = compute_pa_mpjpe(all_pred_valid, all_gt_valid)
+        mpjpe = float(np.mean(mpjpe_array))
+        pa_mpjpe = float(np.mean(pa_mpjpe_array))
+        avg_metric = (mpjpe + pa_mpjpe) / 2.0
+    else:
+        mpjpe = float("inf")
+        pa_mpjpe = float("inf")
+        avg_metric = float("inf")
+
+    metrics_dict = {
+        "test_loss": avg_loss,
+        "mpjpe": mpjpe,
+        "pa_mpjpe": pa_mpjpe,
+        "avg_metric": avg_metric,
+    }
+
+    if rank == 0 and writer is not None:
+        writer.add_scalar("val/loss", avg_loss, epoch)
+        writer.add_scalar("val/mpjpe", mpjpe, epoch)
+        writer.add_scalar("val/pa_mpjpe", pa_mpjpe, epoch)
+        writer.add_scalar("val/avg_metric", avg_metric, epoch)
+
+    return metrics_dict
+
+
 def _initialize_geom_embed(model: GPGFormer, config: dict, device: torch.device) -> None:
     dataset_cfg = config.get("dataset", {})
     img_size = dataset_cfg.get("img_size", 256)
@@ -373,8 +657,9 @@ def main():
         os.makedirs(config["training"]["log_dir"], exist_ok=True)
         writer = SummaryWriter(config["training"]["log_dir"])
 
-    best_val = None
+    best_avg_metric = None
     total_steps = 0
+    debug_printed = False
 
     for epoch in range(start_epoch, config["training"]["num_epochs"]):
         if distributed and isinstance(train_loader.sampler, DistributedSampler):
@@ -408,6 +693,25 @@ def main():
                 cam_param = cam_param.to(device)
             preds = model(rgb, bboxes, cam_param=cam_param)
 
+            if not debug_printed and rank == 0 and epoch == 0 and preds.get("pred_joints") is not None and "joints_3d_gt" in batch:
+                pred_joints = preds["pred_joints"].detach()
+                gt_joints = batch["joints_3d_gt"].detach()
+                print(f"\n[Debug Batch 0]")
+                print(f"  GT 3D joints mean: {gt_joints.mean():.3f}, std: {gt_joints.std():.3f}")
+                print(f"  GT 3D joints range: [{gt_joints.min():.3f}, {gt_joints.max():.3f}]")
+                print(f"  Pred 3D joints mean: {pred_joints.mean():.3f}, std: {pred_joints.std():.3f}")
+                print(f"  Pred 3D joints range: [{pred_joints.min():.3f}, {pred_joints.max():.3f}]")
+                print(f"  GT root joint (batch 0): {gt_joints[0, 0, :]}")
+                print(f"  Pred root joint (batch 0): {pred_joints[0, 0, :]}")
+                if preds.get("pred_cam_t") is not None:
+                    print(f"  Pred cam_t mean: {preds['pred_cam_t'].mean():.3f}, std: {preds['pred_cam_t'].std():.3f}")
+                if "mano_trans" in batch:
+                    cam_t_debug = batch.get("cam_t") if batch.get("cam_t") is not None else batch.get("mano_trans")
+                    if cam_t_debug is not None:
+                        cam_t_debug = cam_t_debug.detach()
+                        print(f"  GT cam_t mean: {cam_t_debug.mean():.3f}, std: {cam_t_debug.std():.3f}")
+                debug_printed = True
+
             cam_t = batch.get("cam_t")
             if cam_t is None and "mano_trans" in batch:
                 cam_t = batch.get("mano_trans")
@@ -435,54 +739,57 @@ def main():
                 pbar.set_postfix(loss=float(loss))
                 if writer is not None and total_steps % config["training"]["log_freq"] == 0:
                     writer.add_scalar("train/loss", float(loss), total_steps)
+                if total_steps % 100 == 0:
+                    with torch.no_grad():
+                        breakdown = _compute_loss_breakdown(criterion, preds, targets)
+                    print(
+                        f"[Step {total_steps}] "
+                        f"pose={breakdown['loss_pose']:.3f}, "
+                        f"shape={breakdown['loss_shape']:.3f}, "
+                        f"cam={breakdown['loss_cam']:.3f}, "
+                        f"j2d={breakdown['loss_joints_2d']:.3f}, "
+                        f"j3d={breakdown['loss_joints_3d']:.3f}, "
+                        f"total={breakdown['total_loss']:.3f}"
+                    )
 
         if scheduler is not None:
             scheduler.step()
 
-        if val_loader is not None and (epoch + 1) % config["training"]["test_freq"] == 0:
-            model.eval()
-            val_loss = 0.0
-            val_steps = 0
-            with torch.no_grad():
-                for batch in tqdm(val_loader, desc=f"Val {epoch}", disable=(rank != 0)):
-                    rgb = batch["rgb"].to(device)
-                    bboxes = batch.get("bbox")
-                    if bboxes is None:
-                        bboxes = torch.tensor(
-                            [[0, 0, rgb.shape[-1] - 1, rgb.shape[-2] - 1]] * rgb.shape[0],
-                            dtype=torch.float32,
-                            device=device,
-                        )
-                    else:
-                        bboxes = bboxes.to(device)
-                    cam_param = batch.get("cam_param")
-                    if cam_param is not None:
-                        cam_param = cam_param.to(device)
-                    preds = model(rgb, bboxes, cam_param=cam_param)
-                    cam_t = batch.get("cam_t")
-                    if cam_t is None and "mano_trans" in batch:
-                        cam_t = batch.get("mano_trans")
-                    joints_2d = None
-                    if "joint_img" in batch:
-                        joint_img = batch["joint_img"].to(device)
-                        if joint_img.dim() == 3:
-                            conf = torch.ones_like(joint_img[..., :1])
-                            joints_2d = torch.cat([joint_img[..., :2], conf], dim=-1)
-                    targets = {
-                        "mano_pose": batch.get("mano_pose").to(device) if "mano_pose" in batch else None,
-                        "mano_shape": batch.get("mano_shape").to(device) if "mano_shape" in batch else None,
-                        "cam_t": cam_t.to(device) if cam_t is not None else None,
-                        "joints_3d_gt": batch.get("joints_3d_gt").to(device) if "joints_3d_gt" in batch else None,
-                        "joints_2d": joints_2d,
-                    }
-                    loss = criterion(preds, targets)
-                    val_loss += float(loss)
-                    val_steps += 1
-            val_loss = val_loss / max(val_steps, 1)
-            if rank == 0 and writer is not None:
-                writer.add_scalar("val/loss", val_loss, epoch)
-            if best_val is None or val_loss < best_val:
-                best_val = val_loss
+        if val_loader is not None:
+            val_metrics = test(
+                model,
+                val_loader,
+                criterion,
+                device,
+                epoch,
+                writer,
+                rank,
+                distributed,
+                detector,
+            )
+            if rank == 0:
+                mpjpe = val_metrics.get("mpjpe", float("inf"))
+                pa_mpjpe = val_metrics.get("pa_mpjpe", float("inf"))
+                avg_metric = val_metrics.get("avg_metric", float("inf"))
+                print(
+                    f"Val {epoch}: MPJPE: {mpjpe:.3f} mm, PA-MPJPE: {pa_mpjpe:.3f} mm, "
+                    f"Avg Metric: {avg_metric:.3f} mm"
+                )
+                if best_avg_metric is None or avg_metric < best_avg_metric:
+                    best_avg_metric = avg_metric
+                    ckpt_path = os.path.join(config["training"]["save_dir"], "gpgformer_best.pt")
+                    torch.save(
+                        {
+                            "epoch": epoch,
+                            "state_dict": _strip_moge_from_state_dict(model.state_dict()),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+                            "mpjpe": mpjpe,
+                            "pa_mpjpe": pa_mpjpe,
+                            "avg_metric": avg_metric,
+                        },
+                        ckpt_path,
+                    )
         model.train()
 
         if rank == 0 and (epoch + 1) % config["training"]["save_freq"] == 0:
@@ -490,7 +797,7 @@ def main():
             torch.save(
                 {
                     "epoch": epoch,
-                    "state_dict": model.state_dict(),
+                    "state_dict": _strip_moge_from_state_dict(model.state_dict()),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
                 },
