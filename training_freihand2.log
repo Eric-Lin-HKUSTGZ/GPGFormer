@@ -1,0 +1,153 @@
+nohup: ignoring input
+W0110 23:03:52.800000 3559747 site-packages/torch/distributed/run.py:803] 
+W0110 23:03:52.800000 3559747 site-packages/torch/distributed/run.py:803] *****************************************
+W0110 23:03:52.800000 3559747 site-packages/torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0110 23:03:52.800000 3559747 site-packages/torch/distributed/run.py:803] *****************************************
+/data0/users/Robert/linweiquan/GPGFormer/third_party/wilor_min/wilor/models/mano_wrapper.py:19: FutureWarning: In the future `np.object` will be defined as the corresponding NumPy scalar.
+  if not hasattr(_np, _k):
+/data0/users/Robert/linweiquan/GPGFormer/third_party/wilor_min/wilor/models/mano_wrapper.py:19: FutureWarning: In the future `np.str` will be defined as the corresponding NumPy scalar.
+  if not hasattr(_np, _k):
+/data0/users/Robert/linweiquan/GPGFormer/third_party/wilor_min/wilor/models/mano_wrapper.py:19: FutureWarning: In the future `np.object` will be defined as the corresponding NumPy scalar.
+  if not hasattr(_np, _k):
+/data0/users/Robert/linweiquan/GPGFormer/third_party/wilor_min/wilor/models/mano_wrapper.py:19: FutureWarning: In the future `np.str` will be defined as the corresponding NumPy scalar.
+  if not hasattr(_np, _k):
+/data0/users/Robert/linweiquan/GPGFormer/third_party/wilor_min/wilor/models/mano_wrapper.py:19: FutureWarning: In the future `np.object` will be defined as the corresponding NumPy scalar.
+  if not hasattr(_np, _k):
+/data0/users/Robert/linweiquan/GPGFormer/third_party/wilor_min/wilor/models/mano_wrapper.py:19: FutureWarning: In the future `np.str` will be defined as the corresponding NumPy scalar.
+  if not hasattr(_np, _k):
+/data0/users/Robert/linweiquan/GPGFormer/third_party/wilor_min/wilor/models/mano_wrapper.py:19: FutureWarning: In the future `np.object` will be defined as the corresponding NumPy scalar.
+  if not hasattr(_np, _k):
+/data0/users/Robert/linweiquan/GPGFormer/third_party/wilor_min/wilor/models/mano_wrapper.py:19: FutureWarning: In the future `np.str` will be defined as the corresponding NumPy scalar.
+  if not hasattr(_np, _k):
+/data0/users/Robert/linweiquan/GPGFormer/third_party/wilor_min/wilor/models/mano_wrapper.py:19: FutureWarning: In the future `np.object` will be defined as the corresponding NumPy scalar.
+  if not hasattr(_np, _k):
+/data0/users/Robert/linweiquan/GPGFormer/third_party/wilor_min/wilor/models/mano_wrapper.py:19: FutureWarning: In the future `np.str` will be defined as the corresponding NumPy scalar.
+  if not hasattr(_np, _k):
+/data0/users/Robert/linweiquan/GPGFormer/third_party/wilor_min/wilor/models/mano_wrapper.py:19: FutureWarning: In the future `np.object` will be defined as the corresponding NumPy scalar.
+  if not hasattr(_np, _k):
+/data0/users/Robert/linweiquan/GPGFormer/third_party/wilor_min/wilor/models/mano_wrapper.py:19: FutureWarning: In the future `np.str` will be defined as the corresponding NumPy scalar.
+  if not hasattr(_np, _k):
+Traceback (most recent call last):
+  File "/data0/users/Robert/linweiquan/GPGFormer/train.py", line 433, in <module>
+    main()
+  File "/data0/users/Robert/linweiquan/GPGFormer/train.py", line 163, in main
+    cfg = yaml.safe_load(Path(args.config).read_text())
+  File "/data0/users/Robert/miniconda3/envs/moge/lib/python3.10/pathlib.py", line 1134, in read_text
+    with self.open(mode='r', encoding=encoding, errors=errors) as f:
+  File "/data0/users/Robert/miniconda3/envs/moge/lib/python3.10/pathlib.py", line 1119, in open
+    return self._accessor.open(self, mode, buffering, encoding, errors,
+FileNotFoundError: [Errno 2] No such file or directory: 'config/config_freihand.yaml'
+Traceback (most recent call last):
+  File "/data0/users/Robert/linweiquan/GPGFormer/train.py", line 433, in <module>
+    main()
+  File "/data0/users/Robert/linweiquan/GPGFormer/train.py", line 163, in main
+    cfg = yaml.safe_load(Path(args.config).read_text())
+  File "/data0/users/Robert/miniconda3/envs/moge/lib/python3.10/pathlib.py", line 1134, in read_text
+    with self.open(mode='r', encoding=encoding, errors=errors) as f:
+  File "/data0/users/Robert/miniconda3/envs/moge/lib/python3.10/pathlib.py", line 1119, in open
+    return self._accessor.open(self, mode, buffering, encoding, errors,
+FileNotFoundError: [Errno 2] No such file or directory: 'config/config_freihand.yaml'
+Traceback (most recent call last):
+  File "/data0/users/Robert/linweiquan/GPGFormer/train.py", line 433, in <module>
+    main()
+  File "/data0/users/Robert/linweiquan/GPGFormer/train.py", line 163, in main
+    cfg = yaml.safe_load(Path(args.config).read_text())
+  File "/data0/users/Robert/miniconda3/envs/moge/lib/python3.10/pathlib.py", line 1134, in read_text
+    with self.open(mode='r', encoding=encoding, errors=errors) as f:
+  File "/data0/users/Robert/miniconda3/envs/moge/lib/python3.10/pathlib.py", line 1119, in open
+    return self._accessor.open(self, mode, buffering, encoding, errors,
+FileNotFoundError: [Errno 2] No such file or directory: 'config/config_freihand.yaml'
+Traceback (most recent call last):
+  File "/data0/users/Robert/linweiquan/GPGFormer/train.py", line 433, in <module>
+    main()
+  File "/data0/users/Robert/linweiquan/GPGFormer/train.py", line 163, in main
+    cfg = yaml.safe_load(Path(args.config).read_text())
+  File "/data0/users/Robert/miniconda3/envs/moge/lib/python3.10/pathlib.py", line 1134, in read_text
+    with self.open(mode='r', encoding=encoding, errors=errors) as f:
+  File "/data0/users/Robert/miniconda3/envs/moge/lib/python3.10/pathlib.py", line 1119, in open
+    return self._accessor.open(self, mode, buffering, encoding, errors,
+FileNotFoundError: [Errno 2] No such file or directory: 'config/config_freihand.yaml'
+Traceback (most recent call last):
+  File "/data0/users/Robert/linweiquan/GPGFormer/train.py", line 433, in <module>
+    main()
+  File "/data0/users/Robert/linweiquan/GPGFormer/train.py", line 163, in main
+    cfg = yaml.safe_load(Path(args.config).read_text())
+  File "/data0/users/Robert/miniconda3/envs/moge/lib/python3.10/pathlib.py", line 1134, in read_text
+    with self.open(mode='r', encoding=encoding, errors=errors) as f:
+  File "/data0/users/Robert/miniconda3/envs/moge/lib/python3.10/pathlib.py", line 1119, in open
+    return self._accessor.open(self, mode, buffering, encoding, errors,
+FileNotFoundError: [Errno 2] No such file or directory: 'config/config_freihand.yaml'
+Traceback (most recent call last):
+  File "/data0/users/Robert/linweiquan/GPGFormer/train.py", line 433, in <module>
+    main()
+  File "/data0/users/Robert/linweiquan/GPGFormer/train.py", line 163, in main
+    cfg = yaml.safe_load(Path(args.config).read_text())
+  File "/data0/users/Robert/miniconda3/envs/moge/lib/python3.10/pathlib.py", line 1134, in read_text
+    with self.open(mode='r', encoding=encoding, errors=errors) as f:
+  File "/data0/users/Robert/miniconda3/envs/moge/lib/python3.10/pathlib.py", line 1119, in open
+    return self._accessor.open(self, mode, buffering, encoding, errors,
+FileNotFoundError: [Errno 2] No such file or directory: 'config/config_freihand.yaml'
+E0110 23:03:54.697000 3559747 site-packages/torch/distributed/elastic/multiprocessing/api.py:882] failed (exitcode: 1) local_rank: 0 (pid: 3559875) of binary: /data0/users/Robert/miniconda3/envs/moge/bin/python3.10
+Traceback (most recent call last):
+  File "/data0/users/Robert/miniconda3/envs/moge/bin/torchrun", line 7, in <module>
+    sys.exit(main())
+  File "/data0/users/Robert/miniconda3/envs/moge/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 357, in wrapper
+    return f(*args, **kwargs)
+  File "/data0/users/Robert/miniconda3/envs/moge/lib/python3.10/site-packages/torch/distributed/run.py", line 936, in main
+    run(args)
+  File "/data0/users/Robert/miniconda3/envs/moge/lib/python3.10/site-packages/torch/distributed/run.py", line 927, in run
+    elastic_launch(
+  File "/data0/users/Robert/miniconda3/envs/moge/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 156, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+  File "/data0/users/Robert/miniconda3/envs/moge/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 293, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+train.py FAILED
+------------------------------------------------------------
+Failures:
+[1]:
+  time      : 2026-01-10_23:03:54
+  host      : localhost
+  rank      : 1 (local_rank: 1)
+  exitcode  : 1 (pid: 3559876)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[2]:
+  time      : 2026-01-10_23:03:54
+  host      : localhost
+  rank      : 2 (local_rank: 2)
+  exitcode  : 1 (pid: 3559877)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[3]:
+  time      : 2026-01-10_23:03:54
+  host      : localhost
+  rank      : 3 (local_rank: 3)
+  exitcode  : 1 (pid: 3559878)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[4]:
+  time      : 2026-01-10_23:03:54
+  host      : localhost
+  rank      : 4 (local_rank: 4)
+  exitcode  : 1 (pid: 3559879)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[5]:
+  time      : 2026-01-10_23:03:54
+  host      : localhost
+  rank      : 5 (local_rank: 5)
+  exitcode  : 1 (pid: 3559880)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-01-10_23:03:54
+  host      : localhost
+  rank      : 0 (local_rank: 0)
+  exitcode  : 1 (pid: 3559875)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================

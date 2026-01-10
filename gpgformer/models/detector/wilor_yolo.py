@@ -53,6 +53,12 @@ class WiLoRYOLODetector:
         if not torch.cuda.is_available():
             return "cpu"
 
+        # In DDP training, running the detector on GPU can permanently occupy VRAM after the first
+        # validation call, causing the *next epoch*'s training forward to OOM. Default to CPU in
+        # distributed mode unless the user explicitly overrides via GPGFORMER_DETECTOR_DEVICE.
+        if os.environ.get("RANK", None) is not None and os.environ.get("WORLD_SIZE", None) is not None:
+            return "cpu"
+
         # Prefer LOCAL_RANK so each DDP process uses its own GPU
         lr = os.environ.get("LOCAL_RANK", None)
         if lr is not None:
