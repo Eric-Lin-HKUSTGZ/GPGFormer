@@ -1,0 +1,53 @@
+dataset:
+  name: ho3d
+  img_size: 256
+  ho3d_version: v3
+  align_wilor_aug: true
+  bbox_source_eval: detector
+  wilor_aug_config:
+    SCALE_FACTOR: 0.3
+    ROT_FACTOR: 30
+    TRANS_FACTOR: 0.02
+    COLOR_SCALE: 0.2
+    ROT_AUG_RATE: 0.6
+    TRANS_AUG_RATE: 0.5
+    DO_FLIP: false
+    FLIP_AUG_RATE: 0.0
+    EXTREME_CROP_AUG_RATE: 0.0
+    EXTREME_CROP_AUG_LEVEL: 1
+
+paths:
+  ho3d_root: /data1/users/Robert/datasets/HO3D_v3
+  wilor_ckpt: /data0/users/Robert/linweiquan/GPGFormer/weights/wilor/wilor_final.ckpt
+  detector_ckpt: /data0/users/Robert/linweiquan/GPGFormer/weights/wilor/detector.pt
+  moge2_ckpt: /data0/users/Robert/linweiquan/GPGFormer/weights/moge2/model.pt
+  mano_dir: /data0/users/Robert/linweiquan/GPGFormer/weights/mano
+  mano_mean_params: /data0/users/Robert/linweiquan/GPGFormer/weights/mano/mano_mean_params.npz
+
+model:
+  image_size: 256
+  focal_length: 5000
+
+loss:
+  reduction: mean
+  w_2d: 5.0
+  w_3d_joint: 1.0
+  w_3d_vert: 0.5
+  w_global_orient: 10.0
+  w_hand_pose: 10.0
+  w_scale: 0.0
+
+train:
+  use_cuda: true
+  epochs: 50
+  batch_size: 16
+  val_batch_size: 16
+  lr: 5.0e-5
+  weight_decay: 1.0e-4
+  warmup_epochs: 1
+  min_lr: 0.0
+  num_workers: 4
+  out_dir: checkpoints
+
+
+

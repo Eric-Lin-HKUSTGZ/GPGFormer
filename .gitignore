@@ -1,5 +1,4 @@
-checkpoints
-pretrained_model
-mano_data
+weights
+log
 logs
-*.log
+checkpoints

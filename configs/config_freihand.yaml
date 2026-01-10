@@ -1,0 +1,54 @@
+dataset:
+  name: freihand
+  img_size: 256
+  align_wilor_aug: true
+  # Train uses GT bbox (from keypoints); eval/test uses detector bbox
+  bbox_source_eval: detector
+  wilor_aug_config:
+    SCALE_FACTOR: 0.3
+    ROT_FACTOR: 30
+    TRANS_FACTOR: 0.02
+    COLOR_SCALE: 0.2
+    ROT_AUG_RATE: 0.6
+    TRANS_AUG_RATE: 0.5
+    DO_FLIP: false
+    FLIP_AUG_RATE: 0.0
+    EXTREME_CROP_AUG_RATE: 0.0
+    EXTREME_CROP_AUG_LEVEL: 1
+
+paths:
+  freihand_root: /data1/users/Robert/datasets/FreiHAND_pub_v2
+  freihand_eval_root: /data1/users/Robert/datasets/FreiHAND_pub_v2_eval
+  wilor_ckpt: /data0/users/Robert/linweiquan/GPGFormer/weights/wilor/wilor_final.ckpt
+  detector_ckpt: /data0/users/Robert/linweiquan/GPGFormer/weights/wilor/detector.pt
+  moge2_ckpt: /data0/users/Robert/linweiquan/GPGFormer/weights/moge2/model.pt
+  mano_dir: /data0/users/Robert/linweiquan/GPGFormer/weights/mano
+  mano_mean_params: /data0/users/Robert/linweiquan/GPGFormer/weights/mano/mano_mean_params.npz
+
+model:
+  image_size: 256
+  focal_length: 5000
+
+loss:
+  reduction: mean
+  w_2d: 5.0
+  w_3d_joint: 1.0
+  w_3d_vert: 0.5
+  w_global_orient: 10.0
+  w_hand_pose: 10.0
+  w_scale: 0.0
+
+train:
+  use_cuda: true
+  epochs: 50
+  batch_size: 16
+  val_batch_size: 16
+  lr: 5.0e-5
+  weight_decay: 5.0e-5
+  warmup_epochs: 5
+  min_lr: 0.0
+  num_workers: 8
+  out_dir: checkpoints
+
+
+
