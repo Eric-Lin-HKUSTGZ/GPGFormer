@@ -2,6 +2,12 @@ dataset:
   name: ho3d
   img_size: 256
   ho3d_version: v3
+  # Split train.txt into train/val for metrics (HO3D evaluation split often lacks full GT joints)
+  ho3d_val_split: val
+  ho3d_eval_split: val
+  ho3d_trainval_ratio: 0.9
+  ho3d_trainval_seed: 42
+  ho3d_trainval_split_by: sequence  # sequence | frame
   align_wilor_aug: true
   bbox_source_eval: detector
   wilor_aug_config:
@@ -27,6 +33,16 @@ paths:
 model:
   image_size: 256
   focal_length: 5000
+  mano_head:
+    # HaMeR-style MANO head (cross-attn TransformerDecoder + IEF)
+    ief_iters: 3
+    transformer_input: mean_shape  # mean_shape | zero
+    dim: 1024
+    depth: 6
+    heads: 8
+    dim_head: 64
+    mlp_dim: 2048
+    dropout: 0.0
 
 loss:
   reduction: mean
@@ -44,7 +60,7 @@ train:
   val_batch_size: 16
   lr: 5.0e-5
   weight_decay: 1.0e-4
-  warmup_epochs: 1
+  warmup_epochs: 5
   min_lr: 0.0
   num_workers: 4
   out_dir: checkpoints

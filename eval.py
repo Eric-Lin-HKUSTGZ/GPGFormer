@@ -38,8 +38,15 @@ def build_dataset(cfg: dict):
     if name in ("ho3d",):
         from data.ho3d_dataset import HO3DDataset
 
+        # For HO3D, the public "evaluation/test" split may not contain full 21-joint GT.
+        # Allow overriding for meaningful metric computation.
+        ho3d_eval_split = str(cfg["dataset"].get("ho3d_eval_split", "val")).lower()
+        if ho3d_eval_split in ("evaluation", "test"):
+            # Keep as-is (useful for generating predictions), but metrics like PA-MPJPE can be meaningless.
+            pass
+
         return HO3DDataset(
-            data_split="test",
+            data_split=ho3d_eval_split,
             root_dir=cfg["paths"]["ho3d_root"],
             dataset_version=cfg["dataset"].get("ho3d_version", "v3"),
             img_size=int(cfg["dataset"].get("img_size", 256)),
@@ -49,6 +56,9 @@ def build_dataset(cfg: dict):
             wilor_aug_config=cfg["dataset"].get("wilor_aug_config", {}),
             bbox_source=bbox_source,
             detector_weights_path=detector_path,
+            trainval_ratio=float(cfg["dataset"].get("ho3d_trainval_ratio", 0.9)),
+            trainval_seed=int(cfg["dataset"].get("ho3d_trainval_seed", 42)),
+            trainval_split_by=str(cfg["dataset"].get("ho3d_trainval_split_by", "sequence")),
         )
 
     if name in ("freihand",):
@@ -106,6 +116,14 @@ def main():
             mano_model_path=cfg["paths"]["mano_dir"],
             mano_mean_params=cfg["paths"]["mano_mean_params"],
             focal_length=float(cfg["model"].get("focal_length", 5000.0)),
+            mano_head_ief_iters=int(cfg["model"].get("mano_head", {}).get("ief_iters", 3)),
+            mano_head_transformer_input=str(cfg["model"].get("mano_head", {}).get("transformer_input", "mean_shape")),
+            mano_head_dim=int(cfg["model"].get("mano_head", {}).get("dim", 1024)),
+            mano_head_depth=int(cfg["model"].get("mano_head", {}).get("depth", 6)),
+            mano_head_heads=int(cfg["model"].get("mano_head", {}).get("heads", 8)),
+            mano_head_dim_head=int(cfg["model"].get("mano_head", {}).get("dim_head", 64)),
+            mano_head_mlp_dim=int(cfg["model"].get("mano_head", {}).get("mlp_dim", 2048)),
+            mano_head_dropout=float(cfg["model"].get("mano_head", {}).get("dropout", 0.0)),
         )
     ).to(device)
 
@@ -119,6 +137,7 @@ def main():
     n = torch.zeros((), device=device, dtype=torch.float64)
     with torch.no_grad():
         it = tqdm(loader, desc="eval", disable=(not is_main_process()))
+        warned_degenerate_gt = False
         for batch in it:
             img = batch["rgb"].to(device)
             cam_param = batch.get("cam_param", None)
@@ -129,6 +148,18 @@ def main():
             pred_j_mm = (out["pred_keypoints_3d"] + pred_t_m.unsqueeze(1)) * 1000.0
 
             gt_j_mm = batch["joints_3d_gt"].to(device)
+
+            gt_var = gt_j_mm.var(dim=(1, 2))
+            finite_mask = torch.isfinite(gt_j_mm).all(dim=(1, 2))
+            valid_mask = (gt_var > 1e-8) & finite_mask
+            if not bool(valid_mask.any()):
+                if (not warned_degenerate_gt) and is_main_process():
+                    print("[warn] Skipping eval batch with degenerate/invalid GT joints; metrics are not meaningful for this split.")
+                    warned_degenerate_gt = True
+                continue
+
+            pred_j_mm = pred_j_mm[valid_mask]
+            gt_j_mm = gt_j_mm[valid_mask]
 
             # MPJPE (mm)
             mpjpe = (pred_j_mm - gt_j_mm).norm(dim=-1).mean(dim=-1)  # (B,)
@@ -146,9 +177,13 @@ def main():
         all_reduce_sum(n)
 
     if is_main_process():
-        denom = float(max(float(n.item()), 1.0))
-        print(f"MPJPE(mm): {float(mpjpe_sum.item()) / denom:.3f}")
-        print(f"PA-MPJPE(mm): {float(pampjpe_sum.item()) / denom:.3f}")
+        denom = float(n.item())
+        if denom <= 0:
+            print("MPJPE(mm): nan")
+            print("PA-MPJPE(mm): nan")
+        else:
+            print(f"MPJPE(mm): {float(mpjpe_sum.item()) / denom:.3f}")
+            print(f"PA-MPJPE(mm): {float(pampjpe_sum.item()) / denom:.3f}")
 
     cleanup_distributed()
 

@@ -82,16 +82,26 @@ class HO3DDataset(Dataset):
     HO3D Dataset with random modality sampling
     Supports HO3D_v3 format
     """
-    def __init__(self, data_split, root_dir, dataset_version='v3', img_size=256, 
+    def __init__(
+                 self,
+                 data_split,
+                 root_dir,
+                 dataset_version='v3',
+                 img_size=256,
                  aug_para=[10, 0.2, 180], cube_size=[280, 280, 280],
                  input_modal='RGBD', color_factor=0.2, p_drop=0.4, train=True,
                  aug_prob=0.8, color_aug_prob=0.6, align_wilor_aug=False,
                  wilor_aug_config=None,
                  bbox_source: str = "gt",
-                 detector_weights_path: str | None = None):
+                 detector_weights_path: str | None = None,
+                 # ---- train/val split carved from train.txt (for HO3D v3 where evaluation split lacks GT) ----
+                 trainval_ratio: float = 0.9,
+                 trainval_seed: int = 42,
+                 trainval_split_by: str = "sequence",  # "sequence" | "frame"
+                 ):
         """
         Args:
-            data_split: 'train', 'test', or 'train_all'
+            data_split: 'train', 'val', 'test', 'evaluation', or 'train_all'
             root_dir: root directory containing HO3D_v3 folder
             dataset_version: 'v3' for HO3D_v3
             img_size: output image size
@@ -105,6 +115,9 @@ class HO3DDataset(Dataset):
             color_aug_prob: probability to apply color augmentation
         """
         self.data_split = data_split
+        self.trainval_ratio = float(trainval_ratio)
+        self.trainval_seed = int(trainval_seed)
+        self.trainval_split_by = str(trainval_split_by).lower()
         self.dataset_version = dataset_version
         # Allow passing either the dataset parent dir or the HO3D_v3 dir itself
         candidate_root = osp.join(root_dir, 'HO3D_%s' % (dataset_version))
@@ -143,88 +156,169 @@ class HO3DDataset(Dataset):
         self.datalist = self.load_data()
         print(f'HO3D Dataset loaded: {self.dataset_len} samples from {data_split} split')
 
-    def load_data(self):
-        """Load dataset annotations from pickle files (HO3D_v3 format)"""
-        # HO3D_v3 has train.txt and evaluation.txt (no test.txt)
-        # Map 'test' to 'evaluation'
-        split_name = self.data_split
-        if split_name == 'test':
-            split_name = 'evaluation'
-        
-        # Read image list from train.txt or evaluation.txt
-        split_file = osp.join(self.root_dir, f'{split_name}.txt')
-        if not osp.exists(split_file):
-            raise FileNotFoundError(f"Split file not found: {split_file}")
-        
-        datalist = []
-        # Map split to folder name
-        if split_name == 'train':
-            split_folder = 'train'
-        else:
-            split_folder = 'evaluation'  # evaluation or test -> evaluation folder
-        
+    def _read_split_lines(self, split_file: str):
+        lines = []
         with open(split_file, 'r') as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
+                lines.append(line)
+        return lines
+
+    def _split_train_lines(self, train_lines: list[str]):
+        """
+        Deterministically split train.txt into train/val subsets.
+        - split_by="sequence": group by sequence to avoid leakage, then pack sequences to hit ratio by #frames.
+        - split_by="frame": shuffle individual frames and take first ratio as train.
+        """
+        ratio = float(self.trainval_ratio)
+        ratio = max(0.0, min(1.0, ratio))
+        seed = int(self.trainval_seed)
+
+        # Edge cases
+        if len(train_lines) == 0:
+            return [], []
+        if ratio <= 0.0:
+            return [], list(train_lines)
+        if ratio >= 1.0:
+            return list(train_lines), []
+
+        split_by = str(self.trainval_split_by).lower()
+        if split_by not in ("sequence", "frame"):
+            split_by = "sequence"
+
+        if split_by == "frame":
+            rng = random.Random(seed)
+            lines = list(train_lines)
+            rng.shuffle(lines)
+            cut = int(len(lines) * ratio)
+            return lines[:cut], lines[cut:]
+
+        # split_by == "sequence"
+        seq_to_lines: dict[str, list[str]] = {}
+        for ln in train_lines:
+            parts = ln.split('/')
+            if len(parts) != 2:
+                continue
+            seq = parts[0]
+            seq_to_lines.setdefault(seq, []).append(ln)
+
+        seqs = list(seq_to_lines.keys())
+        rng = random.Random(seed)
+        rng.shuffle(seqs)
+
+        total = sum(len(v) for v in seq_to_lines.values())
+        target_train = int(total * ratio)
+
+        train_out: list[str] = []
+        val_out: list[str] = []
+        count = 0
+        for seq in seqs:
+            bucket = seq_to_lines[seq]
+            if count < target_train:
+                train_out.extend(bucket)
+                count += len(bucket)
+            else:
+                val_out.extend(bucket)
+
+        # Ensure both splits non-empty if possible
+        if len(train_out) == 0 and len(val_out) > 0:
+            train_out.append(val_out.pop(0))
+        if len(val_out) == 0 and len(train_out) > 1:
+            val_out.append(train_out.pop())
+        return train_out, val_out
+
+    def load_data(self):
+        """Load dataset annotations from pickle files (HO3D_v3 format)"""
+        # HO3D_v3 has train.txt and evaluation.txt (no test.txt).
+        # We additionally support a deterministic "val" split carved out of train.txt (90/10 by default).
+        split_name = str(self.data_split).lower()
+        if split_name == 'test':
+            # Keep backward compatibility: "test" maps to the official evaluation list.
+            split_name = 'evaluation'
+
+        train_txt = osp.join(self.root_dir, 'train.txt')
+        eval_txt = osp.join(self.root_dir, 'evaluation.txt')
+
+        selected_lines: list[str] = []
+        if split_name in ('train', 'val', 'train_all'):
+            if not osp.exists(train_txt):
+                raise FileNotFoundError(f"Split file not found: {train_txt}")
+            all_train_lines = self._read_split_lines(train_txt)
+            train_lines, val_lines = self._split_train_lines(all_train_lines)
+            if split_name == 'train':
+                selected_lines = train_lines
+            elif split_name == 'val':
+                selected_lines = val_lines
+            else:
+                selected_lines = all_train_lines
+            split_folder = 'train'
+        elif split_name == 'evaluation':
+            if not osp.exists(eval_txt):
+                raise FileNotFoundError(f"Split file not found: {eval_txt}")
+            selected_lines = self._read_split_lines(eval_txt)
+            split_folder = 'evaluation'
+        else:
+            raise ValueError(f"Unsupported HO3D split: {self.data_split}")
+        
+        datalist = []
+        for line in selected_lines:
+            # Format: <sequence_name>/<file_id>
+            # e.g., "MC1/0000"
+            parts = line.split('/')
+            if len(parts) != 2:
+                continue
+            seq_name, file_id = parts[0], parts[1]
                 
-                # Format: <sequence_name>/<file_id>
-                # e.g., "MC1/0000"
-                parts = line.split('/')
-                if len(parts) != 2:
+            # Build paths
+            seq_dir = osp.join(self.root_dir, split_folder, seq_name)
+            rgb_path = osp.join(seq_dir, 'rgb', f'{file_id}.jpg')
+            # Try png if jpg doesn't exist
+            if not osp.exists(rgb_path):
+                rgb_path = osp.join(seq_dir, 'rgb', f'{file_id}.png')
+            
+            depth_path = osp.join(seq_dir, 'depth', f'{file_id}.png')
+            meta_path = osp.join(seq_dir, 'meta', f'{file_id}.pkl')
+            
+            # Check if files exist
+            if not osp.exists(rgb_path):
+                continue
+            if not osp.exists(meta_path):
+                continue
+            
+            # Load pickle file
+            try:
+                with open(meta_path, 'rb') as pkl_file:
+                    meta_data = pickle.load(pkl_file)
+            except Exception as e:
+                print(f'Warning: Failed to load {meta_path}: {e}')
+                continue
+                
+            # Check if annotation exists
+            # For evaluation split: handPose, handBeta, handTrans are not available
+            # Only handJoints3D (root joint, 3x1) and handBoundingBox are available
+            is_evaluation = (split_name == 'evaluation')
+            
+            if is_evaluation:
+                # Evaluation data: check for handJoints3D (root joint) or handBoundingBox
+                root_joint_3d = meta_data.get('handJoints3D')
+                hand_bbox = meta_data.get('handBoundingBox')
+                if root_joint_3d is None and hand_bbox is None:
                     continue
-                
-                seq_name, file_id = parts[0], parts[1]
-                
-                # Build paths
-                seq_dir = osp.join(self.root_dir, split_folder, seq_name)
-                rgb_path = osp.join(seq_dir, 'rgb', f'{file_id}.jpg')
-                # Try png if jpg doesn't exist
-                if not osp.exists(rgb_path):
-                    rgb_path = osp.join(seq_dir, 'rgb', f'{file_id}.png')
-                
-                depth_path = osp.join(seq_dir, 'depth', f'{file_id}.png')
-                meta_path = osp.join(seq_dir, 'meta', f'{file_id}.pkl')
-                
-                # Check if files exist
-                if not osp.exists(rgb_path):
+                # Ensure root_joint_3d is a valid array
+                if root_joint_3d is not None:
+                    root_joint_3d = np.array(root_joint_3d, dtype=np.float32)
+                    if root_joint_3d.shape != (3,):
+                        # If it's not (3,), try to reshape or skip
+                        if root_joint_3d.size == 3:
+                            root_joint_3d = root_joint_3d.reshape(3)
+                        else:
+                            continue
+            else:
+                # Train/val data: require full annotations
+                if meta_data.get('handPose') is None or meta_data.get('handJoints3D') is None:
                     continue
-                if not osp.exists(meta_path):
-                    continue
-                
-                # Load pickle file
-                try:
-                    with open(meta_path, 'rb') as pkl_file:
-                        meta_data = pickle.load(pkl_file)
-                except Exception as e:
-                    print(f'Warning: Failed to load {meta_path}: {e}')
-                    continue
-                
-                # Check if annotation exists
-                # For evaluation/test split: handPose, handBeta, handTrans are not available
-                # Only handJoints3D (root joint, 3x1) and handBoundingBox are available
-                is_evaluation = (split_name == 'evaluation')
-                
-                if is_evaluation:
-                    # Evaluation data: check for handJoints3D (root joint) or handBoundingBox
-                    root_joint_3d = meta_data.get('handJoints3D')
-                    hand_bbox = meta_data.get('handBoundingBox')
-                    if root_joint_3d is None and hand_bbox is None:
-                        continue
-                    # Ensure root_joint_3d is a valid array
-                    if root_joint_3d is not None:
-                        root_joint_3d = np.array(root_joint_3d, dtype=np.float32)
-                        if root_joint_3d.shape != (3,):
-                            # If it's not (3,), try to reshape or skip
-                            if root_joint_3d.size == 3:
-                                root_joint_3d = root_joint_3d.reshape(3)
-                            else:
-                                continue
-                else:
-                    # Training data: check for full annotations
-                    if meta_data.get('handPose') is None or meta_data.get('handJoints3D') is None:
-                        continue
                 
                 cam_mat = np.array(meta_data['camMat'], dtype=np.float32)  # (3, 3) intrinsic matrix
                 
@@ -816,9 +910,12 @@ class HO3DDataset(Dataset):
                    intrinsics['princpt'][0], intrinsics['princpt'][1])
         
         # Check if this is evaluation data (no full annotations)
+        # NOTE: 'val' is carved from 'train.txt' and DOES have full GT, so it is NOT evaluation.
         is_evaluation = (self.data_split == 'test' or self.data_split == 'evaluation')
         
-        if self.data_split == 'train' or self.data_split == 'test' or self.data_split == 'train_all' or self.data_split == 'evaluation':
+        # IMPORTANT:
+        # 'val' split is a subset of train.txt, so it should follow the same GT path as 'train'.
+        if self.data_split in ('train', 'val', 'test', 'train_all', 'evaluation'):
             joint_xyz = data['joints_coord_cam'].reshape([21, 3])[HO3D2MANO, :] * 1000  # Convert to mm
             
             if is_evaluation:
@@ -1012,7 +1109,8 @@ class HO3DDataset(Dataset):
         cam_para_tensor = torch.from_numpy(np.array(cam_para)).float()  # (4,)
         
         # MANO parameters
-        if self.data_split == 'train' or self.data_split == 'test' or self.data_split == 'train_all':
+        # 'val' split is carved from train.txt and has GT MANO parameters.
+        if self.data_split in ('train', 'val', 'test', 'train_all'):
             mano_pose_tensor = torch.from_numpy(data['mano_pose']).float()  # (48,)
             mano_shape_tensor = torch.from_numpy(data['mano_shape']).float()  # (10,)
             mano_trans_tensor = torch.from_numpy(data['mano_trans']).float()  # (3,)

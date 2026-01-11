@@ -2,3 +2,5 @@ weights
 log
 logs
 checkpoints
+neurips_gpgformer.md
+*.log

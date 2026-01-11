@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 
 from gpgformer.models.encoders.wilor_vit import WiLoRViTConfig, WiLoRViTWithGeo
+from gpgformer.models.heads.mano_head import MANOHeadConfig, MANOTransformerDecoderHead
 from gpgformer.models.mano.mano_layer import MANOConfig, MANOLayer
 from gpgformer.models.priors.moge2 import MoGe2Config, MoGe2Prior
 from gpgformer.models.tokenizers.geo_tokenizer import GeoTokenizer, CoordPosEmbed
@@ -28,6 +29,16 @@ class GPGFormerConfig:
 
     # MoGe2
     moge2_num_tokens: int = 1600
+
+    # HaMeR-style MANO head (defaults are reasonable if not provided by YAML)
+    mano_head_ief_iters: int = 3
+    mano_head_transformer_input: str = "mean_shape"  # 'mean_shape' or 'zero'
+    mano_head_dim: int = 1024
+    mano_head_depth: int = 6
+    mano_head_heads: int = 8
+    mano_head_dim_head: int = 64
+    mano_head_mlp_dim: int = 2048
+    mano_head_dropout: float = 0.0
 
 
 class GPGFormer(nn.Module):
@@ -57,6 +68,24 @@ class GPGFormer(nn.Module):
                 focal_length=cfg.focal_length,  # fallback when cam_param is not provided
                 joint_rep="aa",
             )
+        )
+
+        # HaMeR-style MANO regression head (cross-attn decoder + IEF)
+        self.mano_head = MANOTransformerDecoderHead(
+            MANOHeadConfig(
+                mean_params_path=cfg.mano_mean_params,
+                num_hand_joints=15,
+                joint_rep="aa",
+                ief_iters=int(cfg.mano_head_ief_iters),
+                transformer_input=str(cfg.mano_head_transformer_input),
+                dim=int(cfg.mano_head_dim),
+                depth=int(cfg.mano_head_depth),
+                heads=int(cfg.mano_head_heads),
+                dim_head=int(cfg.mano_head_dim_head),
+                mlp_dim=int(cfg.mano_head_mlp_dim),
+                dropout=float(cfg.mano_head_dropout),
+            ),
+            context_dim=1280,
         )
 
         self.mano = MANOLayer(MANOConfig(model_path=cfg.mano_model_path, mean_params=cfg.mano_mean_params))
@@ -110,15 +139,44 @@ class GPGFormer(nn.Module):
                 raise ValueError(f"cam_param must be (B,4) or (B,>=2), got {tuple(cam_param.shape)}")
             focal_length_px = cam_param[:, :2]
 
-        out = self.encoder(img_wilor, geo_tokens=geo_tokens, geo_pos=geo_pos, focal_length_px=focal_length_px)
-        mano_params = out["pred_mano_params"]
+        enc_out = self.encoder(img_wilor, geo_tokens=geo_tokens, geo_pos=geo_pos, focal_length_px=focal_length_px)
+        img_feat = enc_out["img_feat"]
+
+        # HaMeR-style MANO prediction from conditioning features (already geo-guided via token fusion)
+        mano_params, pred_cam = self.mano_head(img_feat)
+
+        B = img_feat.shape[0]
+        if focal_length_px is None:
+            focal = torch.full((B, 2), float(self.cfg.focal_length), device=img_feat.device, dtype=img_feat.dtype)
+        else:
+            fl = focal_length_px.to(device=img_feat.device, dtype=img_feat.dtype)
+            if fl.ndim == 0:
+                focal = fl.view(1, 1).expand(B, 2)
+            elif fl.ndim == 1:
+                focal = fl.view(-1, 1).expand(B, 2)
+            elif fl.ndim == 2 and fl.shape[1] == 2:
+                focal = fl
+            else:
+                raise ValueError(f"Unsupported focal_length_px shape: {tuple(fl.shape)} (expected (B,2) or broadcastable)")
+
+        pred_cam_t = torch.stack(
+            [
+                pred_cam[:, 1],
+                pred_cam[:, 2],
+                2.0 * focal[:, 0] / (self.cfg.image_size * pred_cam[:, 0] + 1e-9),
+            ],
+            dim=-1,
+        )
 
         mano_out = self.mano(mano_params, pose2rot=False)
         pred_vertices = mano_out.vertices
         pred_joints = mano_out.joints
 
         return {
-            **out,
+            "img_feat": img_feat,
+            "pred_mano_params": mano_params,
+            "pred_cam": pred_cam,
+            "pred_cam_t": pred_cam_t,
             "pred_vertices": pred_vertices,
             "pred_keypoints_3d": pred_joints,
         }

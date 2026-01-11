@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 
 from gpgformer.utils.attr_dict import AttrDict, to_attr_dict
-from third_party.wilor_min.wilor.utils.geometry import rot6d_to_rotmat, aa_to_rotmat
 from third_party.wilor_min.wilor.models.backbones.vit import vit as wilor_vit_factory
 
 
@@ -25,8 +24,9 @@ class WiLoRViTWithGeo(nn.Module):
     """
     Tokenizer1 + Transformer (WiLoR ViT-L backbone) with injected geometry tokens.
 
-    We reuse WiLoR's ViT which already includes pose/shape/cam special tokens and decoders.
-    We inject geo tokens between the special tokens and the image patch tokens.
+    IMPORTANT (GPGFormer variant):
+    - We do NOT feed any MANO-related special tokens (pose/shape/cam) into the token sequence.
+    - WiLoR ViT is used purely as a (geo-guided) feature extractor: tokens = [geo_tokens, patch_tokens].
     """
 
     def __init__(self, cfg: WiLoRViTConfig, geo_embed_dim: int = 1280):
@@ -48,6 +48,7 @@ class WiLoRViTWithGeo(nn.Module):
         self.backbone = wilor_vit_factory(cfg_obj)
 
         # Learnable type embeddings (special/img/geo). Init to zero to keep pretrained behavior.
+        # NOTE: special token type (0) remains in the table for compatibility, but is unused.
         self.type_embed = nn.Embedding(3, self.backbone.embed_dim)
         nn.init.zeros_(self.type_embed.weight)
 
@@ -56,6 +57,13 @@ class WiLoRViTWithGeo(nn.Module):
 
         self.image_size = cfg.image_size
         self.focal_length = cfg.focal_length
+
+        # We no longer use WiLoR's MANO special-token regressors; freeze them to avoid DDP unused-param pitfalls.
+        for name in ["pose_emb", "shape_emb", "cam_emb", "decpose", "decshape", "deccam"]:
+            m = getattr(self.backbone, name, None)
+            if isinstance(m, nn.Module):
+                for p in m.parameters():
+                    p.requires_grad_(False)
 
     def _load_wilor_backbone(self, ckpt_path: str) -> None:
         ckpt_path = str(Path(ckpt_path))
@@ -110,7 +118,7 @@ class WiLoRViTWithGeo(nn.Module):
         img: torch.Tensor,
         geo_tokens: Optional[torch.Tensor] = None,
         geo_pos: Optional[torch.Tensor] = None,
-        focal_length_px: Optional[torch.Tensor] = None,
+        focal_length_px: Optional[torch.Tensor] = None,  # kept for API compatibility; unused here
     ) -> dict:
         """
         Args:
@@ -118,8 +126,8 @@ class WiLoRViTWithGeo(nn.Module):
             geo_tokens: (B,N2,D=1280) optional
             geo_pos: (N2,D) optional positional enc for geo tokens (broadcasted over batch)
         Returns:
-            dict with pred_mano_params (rotmats), pred_cam (weak-persp), pred_cam_t (persp trans),
-            and img_feat (B,1280,Hp,Wp) like WiLoR.
+            dict with:
+              - img_feat: (B,1280,Hp,Wp) feature map built from patch tokens AFTER attending to geo tokens.
         """
         B = img.shape[0]
 
@@ -130,15 +138,9 @@ class WiLoRViTWithGeo(nn.Module):
         if self.backbone.pos_embed is not None:
             x = x + self.backbone.pos_embed[:, 1:] + self.backbone.pos_embed[:, :1]
 
-        # Special tokens (pose/shape/cam) created exactly like WiLoR
-        pose_tokens = self.backbone.pose_emb(
-            self.backbone.init_hand_pose.reshape(1, 16, self.backbone.joint_rep_dim)
-        ).repeat(B, 1, 1)
-        shape_tokens = self.backbone.shape_emb(self.backbone.init_betas).unsqueeze(1).repeat(B, 1, 1)
-        cam_tokens = self.backbone.cam_emb(self.backbone.init_cam).unsqueeze(1).repeat(B, 1, 1)
-
-        # Assemble token sequence: [special; geo; img]
-        toks = [pose_tokens, shape_tokens, cam_tokens]
+        # Assemble token sequence: [geo; img]
+        toks = []
+        n_geo = 0
 
         if geo_tokens is not None:
             if geo_tokens.shape[-1] != self.backbone.embed_dim:
@@ -146,27 +148,20 @@ class WiLoRViTWithGeo(nn.Module):
             if geo_pos is not None:
                 geo_tokens = geo_tokens + geo_pos.unsqueeze(0).to(dtype=geo_tokens.dtype, device=geo_tokens.device)
             toks.append(geo_tokens)
+            n_geo = geo_tokens.shape[1]
 
         toks.append(x)
         x = torch.cat(toks, dim=1)
 
-        # Apply type embeddings: 0=special, 1=img, 2=geo
-        n_special = pose_tokens.shape[1] + shape_tokens.shape[1] + cam_tokens.shape[1]
-        if geo_tokens is None:
-            type_ids = torch.cat(
-                [
-                    torch.zeros(n_special, device=img.device, dtype=torch.long),
-                    torch.ones(x.shape[1] - n_special, device=img.device, dtype=torch.long),
-                ],
-                dim=0,
-            )
+        # Apply type embeddings: 1=img, 2=geo (0=special unused)
+        if n_geo == 0:
+            type_ids = torch.ones((x.shape[1],), device=img.device, dtype=torch.long)
         else:
-            n_geo = geo_tokens.shape[1]
+            n_img = x.shape[1] - n_geo
             type_ids = torch.cat(
                 [
-                    torch.zeros(n_special, device=img.device, dtype=torch.long),
                     torch.full((n_geo,), 2, device=img.device, dtype=torch.long),
-                    torch.ones(x.shape[1] - n_special - n_geo, device=img.device, dtype=torch.long),
+                    torch.ones((n_img,), device=img.device, dtype=torch.long),
                 ],
                 dim=0,
             )
@@ -180,59 +175,11 @@ class WiLoRViTWithGeo(nn.Module):
                 x = blk(x)
         x = self.backbone.last_norm(x)
 
-        # Decode pose/shape/cam (same slicing as WiLoR)
-        pose_feat = x[:, :16]
-        shape_feat = x[:, 16:17]
-        cam_feat = x[:, 17:18]
-
-        pred_hand_pose = self.backbone.decpose(pose_feat).reshape(B, -1) + self.backbone.init_hand_pose
-        pred_betas = self.backbone.decshape(shape_feat).reshape(B, -1) + self.backbone.init_betas
-        pred_cam = self.backbone.deccam(cam_feat).reshape(B, -1) + self.backbone.init_cam
-
-        # Convert pose to rotmats according to joint_rep
-        if self.backbone.joint_rep_type == "6d":
-            pred_hand_pose_rm = rot6d_to_rotmat(pred_hand_pose.reshape(-1, 6)).view(B, 16, 3, 3)
-        elif self.backbone.joint_rep_type == "aa":
-            pred_hand_pose_rm = aa_to_rotmat(pred_hand_pose.reshape(-1, 3).contiguous()).view(B, 16, 3, 3)
-        else:
-            raise ValueError(f"Unsupported joint_rep_type: {self.backbone.joint_rep_type}")
-        pred_mano_params = {
-            "global_orient": pred_hand_pose_rm[:, [0]],
-            "hand_pose": pred_hand_pose_rm[:, 1:],
-            "betas": pred_betas,
-        }
-
-        # Image feature map tokens are after: special + (optional geo)
-        offset = n_special + (0 if geo_tokens is None else geo_tokens.shape[1])
-        img_feat = x[:, offset:].reshape(B, Hp, Wp, -1).permute(0, 3, 1, 2).contiguous()
-
-        # Compute camera translation (same as WiLoR; focal scaled outside for full-image later)
-        if focal_length_px is None:
-            focal = torch.full((B, 2), float(self.focal_length), device=img.device, dtype=img.dtype)
-        else:
-            fl = focal_length_px.to(device=img.device, dtype=img.dtype)
-            # Accept (B,2) or (B,) / (,) and broadcast to (B,2)
-            if fl.ndim == 0:
-                focal = fl.view(1, 1).expand(B, 2)
-            elif fl.ndim == 1:
-                focal = fl.view(-1, 1).expand(B, 2)
-            elif fl.ndim == 2 and fl.shape[1] == 2:
-                focal = fl
-            else:
-                raise ValueError(f"Unsupported focal_length_px shape: {tuple(fl.shape)} (expected (B,2) or broadcastable)")
-        pred_cam_t = torch.stack(
-            [
-                pred_cam[:, 1],
-                pred_cam[:, 2],
-                2.0 * focal[:, 0] / (self.image_size * pred_cam[:, 0] + 1e-9),
-            ],
-            dim=-1,
-        )
+        # Patch tokens are always at the tail; reshape them into a feature map.
+        patch_out = x if n_geo == 0 else x[:, n_geo:]
+        img_feat = patch_out.reshape(B, Hp, Wp, -1).permute(0, 3, 1, 2).contiguous()
 
         return {
-            "pred_mano_params": pred_mano_params,
-            "pred_cam": pred_cam,
-            "pred_cam_t": pred_cam_t,
             "img_feat": img_feat,
         }
 

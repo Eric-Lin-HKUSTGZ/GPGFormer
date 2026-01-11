@@ -28,6 +28,16 @@ paths:
 model:
   image_size: 256
   focal_length: 5000
+  mano_head:
+    # HaMeR-style MANO head (cross-attn TransformerDecoder + IEF)
+    ief_iters: 3
+    transformer_input: mean_shape  # mean_shape | zero
+    dim: 1024
+    depth: 6
+    heads: 8
+    dim_head: 64
+    mlp_dim: 2048
+    dropout: 0.0
 
 loss:
   reduction: mean
@@ -48,7 +58,7 @@ train:
   warmup_epochs: 5
   min_lr: 0.0
   num_workers: 8
-  out_dir: checkpoints
+  out_dir: checkpoints/freihand_20260111
 
 
 
