@@ -182,3 +182,68 @@ class GPGFormer(nn.Module):
         }
 
 
+
+        geo_feat = self.moge2(img_crop)  # (B,Cg,Hg,Wg)
+        # MoGe2Prior runs under inference_mode; clone to make it a normal tensor usable by autograd modules.
+        geo_feat = geo_feat.clone()
+        self._init_geo_tokenizer_if_needed(geo_feat)
+        assert self.geo_tokenizer is not None
+
+        geo_tokens, coords = self.geo_tokenizer(geo_feat)  # (B,N2,1280), (Hg,Wg,2)
+        geo_pos = self.geo_pos(coords)  # (N2,1280)
+
+        # WiLoR expects ImageNet normalization, while MoGe2 expects [0,1] (and normalizes internally).
+        mean = torch.tensor([0.485, 0.456, 0.406], device=img_crop.device, dtype=img_crop.dtype).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=img_crop.device, dtype=img_crop.dtype).view(1, 3, 1, 1)
+        img_wilor = (img_crop - mean) / std
+
+        # Per-sample focal (preferred): cam_param=(fx,fy,cx,cy) in pixels after crop/affine.
+        focal_length_px = None
+        if cam_param is not None:
+            if cam_param.ndim != 2 or cam_param.shape[-1] < 2:
+                raise ValueError(f"cam_param must be (B,4) or (B,>=2), got {tuple(cam_param.shape)}")
+            focal_length_px = cam_param[:, :2]
+
+        enc_out = self.encoder(img_wilor, geo_tokens=geo_tokens, geo_pos=geo_pos, focal_length_px=focal_length_px)
+        img_feat = enc_out["img_feat"]
+
+        # HaMeR-style MANO prediction from conditioning features (already geo-guided via token fusion)
+        mano_params, pred_cam = self.mano_head(img_feat)
+
+        B = img_feat.shape[0]
+        if focal_length_px is None:
+            focal = torch.full((B, 2), float(self.cfg.focal_length), device=img_feat.device, dtype=img_feat.dtype)
+        else:
+            fl = focal_length_px.to(device=img_feat.device, dtype=img_feat.dtype)
+            if fl.ndim == 0:
+                focal = fl.view(1, 1).expand(B, 2)
+            elif fl.ndim == 1:
+                focal = fl.view(-1, 1).expand(B, 2)
+            elif fl.ndim == 2 and fl.shape[1] == 2:
+                focal = fl
+            else:
+                raise ValueError(f"Unsupported focal_length_px shape: {tuple(fl.shape)} (expected (B,2) or broadcastable)")
+
+        pred_cam_t = torch.stack(
+            [
+                pred_cam[:, 1],
+                pred_cam[:, 2],
+                2.0 * focal[:, 0] / (self.cfg.image_size * pred_cam[:, 0] + 1e-9),
+            ],
+            dim=-1,
+        )
+
+        mano_out = self.mano(mano_params, pose2rot=False)
+        pred_vertices = mano_out.vertices
+        pred_joints = mano_out.joints
+
+        return {
+            "img_feat": img_feat,
+            "pred_mano_params": mano_params,
+            "pred_cam": pred_cam,
+            "pred_cam_t": pred_cam_t,
+            "pred_vertices": pred_vertices,
+            "pred_keypoints_3d": pred_joints,
+        }
+
+

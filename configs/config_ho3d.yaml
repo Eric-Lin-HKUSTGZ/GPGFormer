@@ -51,7 +51,11 @@ loss:
   w_3d_vert: 0.5
   w_global_orient: 10.0
   w_hand_pose: 10.0
-  w_scale: 0.0
+  # Stabilizers for HO3D:
+  # - w_mano_trans directly supervises predicted camera translation (meters) using GT mano_trans.
+  # - w_scale reduces MPJPE >> PA-MPJPE scale drift (dimensionless, log-ratio).
+  w_mano_trans: 1.0
+  w_scale: 0.1
 
 train:
   use_cuda: true
@@ -62,6 +66,14 @@ train:
   weight_decay: 1.0e-4
   warmup_epochs: 5
   min_lr: 0.0
+  # Extra numeric safety
+  grad_clip_norm: 1.0
+  num_workers: 4
+  out_dir: checkpoints
+
+
+
+
   num_workers: 4
   out_dir: checkpoints
 

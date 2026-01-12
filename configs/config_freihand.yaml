@@ -53,8 +53,8 @@ train:
   epochs: 50
   batch_size: 16
   val_batch_size: 16
-  lr: 1.0e-4
-  weight_decay: 5.0e-5
+  lr: 5e-5
+  weight_decay: 1e-4
   warmup_epochs: 5
   min_lr: 0.0
   num_workers: 8

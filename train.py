@@ -299,7 +299,11 @@ def main():
             w_3d_vert=float(loss_cfg.get("w_3d_vert", 0.5)),
             w_global_orient=float(loss_cfg.get("w_global_orient", 10.0)),
             w_hand_pose=float(loss_cfg.get("w_hand_pose", 10.0)),
+            # Optional stabilizers (off by default in existing configs)
+            w_root_abs=float(loss_cfg.get("w_root_abs", 0.0)),
+            w_mano_trans=float(loss_cfg.get("w_mano_trans", 0.0)),
             w_scale=float(loss_cfg.get("w_scale", 0.0)),
+            w_betas=float(loss_cfg.get("w_betas", 0.0)),
             reduction=str(loss_cfg.get("reduction", "mean")),
         ).to(device)
 
@@ -379,16 +383,27 @@ def main():
                         device=device,
                         dtype=img.dtype,
                     )
+                # IMPORTANT:
+                # `out["pred_keypoints_3d"]` is in meters without camera translation.
+                # `perspective_projection()` adds `translation` internally, so DO NOT pre-add `pred_t_m`.
                 pred_kp2d = perspective_projection(
-                    pred_j_mm / 1000.0,  # meters
+                    out["pred_keypoints_3d"],  # meters
                     translation=pred_t_m,
                     focal_length=focal / float(image_size),
                 )
+                # Guard against numerical blow-ups when depth goes near 0.
+                if not torch.isfinite(pred_kp2d).all():
+                    if is_main_process():
+                        print("[warn] Non-finite pred_kp2d encountered; skipping batch to avoid divergence.")
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
 
                 preds = {
                     "keypoints_2d": pred_kp2d,
                     "keypoints_3d": pred_j_mm,
                     "vertices": pred_v_mm,
+                    # Optional loss can supervise translation directly (meters).
+                    "cam_translation": pred_t_m,
                 }
 
                 # Targets
@@ -408,6 +423,14 @@ def main():
                     "keypoints_3d": gt_kp3d,
                     "vertices": gt_v_mm,
                     "vertices_root": gt_root_mm,
+                    # Optional translation supervision (meters)
+                    "mano_trans": gt_t_m,
+                    # HO3D path provides MANO params for all samples in this split.
+                    "has_mano_params": {
+                        "global_orient": torch.ones(B, device=device, dtype=torch.bool),
+                        "hand_pose": torch.ones(B, device=device, dtype=torch.bool),
+                        "betas": torch.ones(B, device=device, dtype=torch.bool),
+                    },
                 }
 
                 loss_dict = criterion(preds, targets)
@@ -415,9 +438,18 @@ def main():
                 loss = loss_dict.get("loss", loss_dict.get("total_loss", None))
                 if loss is None:
                     raise KeyError(f"UTNetLoss did not return 'loss' or 'total_loss'. Keys={list(loss_dict.keys())}")
+                if not torch.isfinite(loss):
+                    if is_main_process():
+                        print("[warn] Non-finite loss encountered; skipping optimizer step.")
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+                # Optional grad clipping for stability (configure train.grad_clip_norm)
+                clip = float(cfg.get("train", {}).get("grad_clip_norm", 0.0) or 0.0)
+                if clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip)
                 optimizer.step()
                 scheduler.step()
 
