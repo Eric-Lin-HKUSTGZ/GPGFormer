@@ -17,64 +17,48 @@ import torch
 from torch.utils.data import Dataset
 import torchvision.transforms as transforms
 from scipy import ndimage
-from .wilor_utils import WILOR_JOINT_MAP
+from .utils import get_example
 
 # HO3D to MANO joint mapping
-HO3D2MANO = [0,
-             1, 2, 3,
-             4, 5, 6,
-             7, 8, 9,
-             10, 11, 12,
-             13, 14, 15,
-             17,
-             18,
-             20,
-             19,
-             16]
+# HO3D2MANO = [0,
+#              1, 2, 3,
+#              4, 5, 6,
+#              7, 8, 9,
+#              10, 11, 12,
+#              13, 14, 15,
+#              17,
+#              18,
+#              20,
+#              19,
+#              16]
 
 
-def transformPoint2D(pt, M):
-    """Transform point in 2D coordinates"""
-    pt2 = np.dot(np.asarray(M).reshape((3, 3)), np.asarray([pt[0], pt[1], 1]))
-    return np.asarray([pt2[0] / pt2[2], pt2[1] / pt2[2]])
+# def transformPoint2D(pt, M):
+#     """Transform point in 2D coordinates"""
+#     pt2 = np.dot(np.asarray(M).reshape((3, 3)), np.asarray([pt[0], pt[1], 1]))
+#     return np.asarray([pt2[0] / pt2[2], pt2[1] / pt2[2]])
 
 
-def transformPoints2D(pts, M):
-    """Transform points in 2D coordinates"""
-    ret = pts.copy()
-    for i in range(pts.shape[0]):
-        ret[i, 0:2] = transformPoint2D(pts[i, 0:2], M)
-    return ret
+# def transformPoints2D(pts, M):
+#     """Transform points in 2D coordinates"""
+#     ret = pts.copy()
+#     for i in range(pts.shape[0]):
+#         ret[i, 0:2] = transformPoint2D(pts[i, 0:2], M)
+#     return ret
 
 
-def rotatePoint2D(p1, center, angle):
-    """Rotate a point in 2D around center"""
-    alpha = angle * np.pi / 180.
-    pp = p1.copy()
-    pp[0:2] -= center[0:2]
-    pr = np.zeros_like(pp)
-    pr[0] = pp[0] * np.cos(alpha) - pp[1] * np.sin(alpha)
-    pr[1] = pp[0] * np.sin(alpha) + pp[1] * np.cos(alpha)
-    pr[2] = pp[2]
-    ps = pr
-    ps[0:2] += center[0:2]
-    return ps
-
-
-def sample_modality(has_depth, p_drop=0.4):
-    """
-    Random modality sampling (OmniVGGT style)
-    Args:
-        has_depth: whether the sample has depth
-        p_drop: probability to drop depth (0.3-0.5)
-    Returns:
-        n_i: 0 if depth is dropped, 1 if depth is kept
-    """
-    if has_depth:
-        n_i = 0 if random.random() < p_drop else 1
-    else:
-        n_i = 0
-    return n_i
+# def rotatePoint2D(p1, center, angle):
+#     """Rotate a point in 2D around center"""
+#     alpha = angle * np.pi / 180.
+#     pp = p1.copy()
+#     pp[0:2] -= center[0:2]
+#     pr = np.zeros_like(pp)
+#     pr[0] = pp[0] * np.cos(alpha) - pp[1] * np.sin(alpha)
+#     pr[1] = pp[0] * np.sin(alpha) + pp[1] * np.cos(alpha)
+#     pr[2] = pp[2]
+#     ps = pr
+#     ps[0:2] += center[0:2]
+#     return ps
 
 
 class HO3DDataset(Dataset):
@@ -98,7 +82,13 @@ class HO3DDataset(Dataset):
                  trainval_ratio: float = 0.9,
                  trainval_seed: int = 42,
                  trainval_split_by: str = "sequence",  # "sequence" | "frame"
-                 ):
+                 root_index: int = 9,
+                 # New augmentation parameters (align with FreiHANDDatasetV2)
+                 center_jitter_factor: float = 0.05,
+                 brightness_limit: tuple = (-0.2, 0.1),
+                 contrast_limit: tuple = (0.8, 1.2),
+                 brightness_prob: float = 0.5,
+                 contrast_prob: float = 0.5):
         """
         Args:
             data_split: 'train', 'val', 'test', 'evaluation', or 'train_all'
@@ -125,10 +115,13 @@ class HO3DDataset(Dataset):
             self.root_dir = candidate_root
         else:
             self.root_dir = root_dir
-        self.root_joint_idx = 0
+        self.root_joint_idx = int(root_index)
         self.color_factor = color_factor
-        self.input_modal = input_modal
+        self.input_modal = "RGB"
         self.img_size = img_size
+        # WiLoR ViT expects 256x192; keep height=img_size, width=0.75*img_size
+        self.patch_height = self.img_size
+        self.patch_width = int(round(self.img_size * 0.75))
         self.aug_para = aug_para
         self.cube_size = cube_size
         self.aug_modes = ['rot', 'com', 'sc', 'none']
@@ -146,11 +139,18 @@ class HO3DDataset(Dataset):
                 raise ValueError("bbox_source='detector' requires detector_weights_path")
             from gpgformer.models.detector.wilor_yolo import WiLoRDetectorConfig, WiLoRYOLODetector
             self.detector = WiLoRYOLODetector(WiLoRDetectorConfig(weights_path=detector_weights_path))
-        # WiLoR uses ImageNet normalization: (img - mean) / std
-        # mean = 255 * [0.485, 0.456, 0.406], std = 255 * [0.229, 0.224, 0.225]
-        self.mean = 255. * np.array([0.485, 0.456, 0.406])  # ImageNet mean
-        self.std = 255. * np.array([0.229, 0.224, 0.225])  # ImageNet std
-        self.transform = transforms.ToTensor()  # Converts to CHW and float32
+
+        # New augmentation parameters (align with FreiHANDDatasetV2)
+        self.center_jitter_factor = float(center_jitter_factor)
+        self.brightness_limit = brightness_limit
+        self.contrast_limit = contrast_limit
+        self.brightness_prob = float(brightness_prob)
+        self.contrast_prob = float(contrast_prob)
+
+        # WiLoR uses ImageNet normalization (align with FreiHANDDatasetV2)
+        self.transform = transforms.ToTensor()
+        self.imagenet_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+        self.imagenet_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
         
         self.dataset_len = 0
         self.datalist = self.load_data()
@@ -278,7 +278,6 @@ class HO3DDataset(Dataset):
             if not osp.exists(rgb_path):
                 rgb_path = osp.join(seq_dir, 'rgb', f'{file_id}.png')
             
-            depth_path = osp.join(seq_dir, 'depth', f'{file_id}.png')
             meta_path = osp.join(seq_dir, 'meta', f'{file_id}.pkl')
             
             # Check if files exist
@@ -421,7 +420,6 @@ class HO3DDataset(Dataset):
                 
                 data = {
                     "img_path": rgb_path,
-                    "depth_path": depth_path,
                     "img_shape": img_shape,
                     "joints_coord_cam": joints_coord_cam,
                     "joints_coord_img": joints_coord_img,
@@ -541,20 +539,6 @@ class HO3DDataset(Dataset):
         bbox[1] = c_y - bbox[3] / 2.
         
         return bbox
-
-    def read_depth_img(self, depth_filename):
-        """Read the depth image in dataset and decode it"""
-        if not osp.exists(depth_filename):
-            return None
-        depth_scale = 0.00012498664727900177
-        depth_img = cv2.imread(depth_filename)
-        if depth_img is None:
-            return None
-        # Convert to uint16 to avoid overflow when multiplying by 256
-        # depth_img is uint8, so we need larger dtype for the calculation
-        dpt = depth_img[:, :, 2].astype(np.uint16) + depth_img[:, :, 1].astype(np.uint16) * 256
-        dpt = dpt.astype(np.float32) * depth_scale * 1000
-        return dpt
 
     def comToBounds(self, com, size, paras):
         """Calculate boundaries from center of mass"""
@@ -893,17 +877,7 @@ class HO3DDataset(Dataset):
         else:
             rgb = None
         
-        # Load Depth
-        depth_path = data.get('depth_path', data['img_path'].replace('rgb', 'depth').replace('.jpg', '.png').replace('.png', '.png'))
-        depth = self.read_depth_img(depth_path)
-        has_depth = depth is not None and depth.size > 0
-        
-        # Random modality sampling (OmniVGGT style)
-        if self.train:
-            n_i = sample_modality(has_depth, self.p_drop)
-        else:
-            # During test, always use depth if available
-            n_i = 1 if has_depth else 0
+        # RGB-only pipeline: ignore depth modality
         
         intrinsics = data['cam_param']
         cam_para = (intrinsics['focal'][0], intrinsics['focal'][1], 
@@ -959,6 +933,15 @@ class HO3DDataset(Dataset):
             if scale[0] < 1 or scale[1] < 1:
                 center = np.array([img_shape[1] / 2.0, img_shape[0] / 2.0], dtype=np.float32)
                 scale = np.array([img_shape[1], img_shape[0]], dtype=np.float32)
+
+            # NEW AUGMENTATION 1: Random center jitter (align with FreiHANDDatasetV2)
+            bbox_size = float(scale.max())
+            if self.train and self.center_jitter_factor > 0:
+                jitter_x = np.random.uniform(-self.center_jitter_factor, self.center_jitter_factor) * bbox_size
+                jitter_y = np.random.uniform(-self.center_jitter_factor, self.center_jitter_factor) * bbox_size
+                center[0] += jitter_x
+                center[1] += jitter_y
+
             mano_pose = data['mano_pose']
             mano_shape = data['mano_shape']
             mano_trans = data['mano_trans']
@@ -976,12 +959,32 @@ class HO3DDataset(Dataset):
             img_patch, keypoints_2d, keypoints_3d, aug_mano_params, _, _, trans = get_example(
                 rgb, center[0], center[1], scale[0], scale[1],
                 keypoints_2d, keypoints_3d, mano_params, has_mano_params,
-                flip_perm, self.img_size, self.img_size,
+                flip_perm, self.patch_width, self.patch_height,
                 None, None,
                 do_augment=self.train, is_right=True,
                 augm_config=self.wilor_aug_config, is_bgr=True,
                 return_trans=True
             )
+
+            # Convert to float [0, 1]
+            imgRGB_01 = torch.from_numpy(img_patch).float() / 255.0
+
+            # NEW AUGMENTATION 2 & 3: Brightness and Contrast adjustment (align with FreiHANDDatasetV2)
+            if self.train:
+                # Apply brightness adjustment
+                if np.random.rand() < self.brightness_prob:
+                    brightness_delta = np.random.uniform(self.brightness_limit[0], self.brightness_limit[1])
+                    imgRGB_01 = torch.clamp(imgRGB_01 + brightness_delta, 0.0, 1.0)
+
+                # Apply contrast adjustment
+                if np.random.rand() < self.contrast_prob:
+                    contrast_factor = np.random.uniform(self.contrast_limit[0], self.contrast_limit[1])
+                    mean_val = imgRGB_01.mean(dim=[1, 2], keepdim=True)
+                    imgRGB_01 = torch.clamp((imgRGB_01 - mean_val) * contrast_factor + mean_val, 0.0, 1.0)
+
+            # Apply ImageNet normalization
+            imgRGB = (imgRGB_01 - self.imagenet_mean) / self.imagenet_std
+
             joints_3d_np = keypoints_3d[:, :3].astype(np.float32)
             mano_pose = np.concatenate(
                 [aug_mano_params['global_orient'], aug_mano_params['hand_pose']],
@@ -996,148 +999,126 @@ class HO3DDataset(Dataset):
             )
             K_patch = trans_3x3 @ K
             cam_para = (K_patch[0, 0], K_patch[1, 1], K_patch[0, 2], K_patch[1, 2])
-            data_depth = torch.zeros((1, self.img_size, self.img_size), dtype=torch.float32)
+            scale_norm = scale / 200.0
+            # bbox_size already calculated earlier for center jitter
+            bbox_expand_factor = float(bbox_size / max((scale_norm * 200.0).max(), 1e-6))
+            uv_xy = keypoints_2d[:, :2]
+            uv_valid = ((uv_xy > -0.5) & (uv_xy < 0.5)).astype(np.float32)
+            uv_valid = (uv_valid[:, 0] * uv_valid[:, 1]).astype(np.float32)
+            xyz_valid = 1.0
+            if uv_valid[self.root_joint_idx] == 0 and uv_valid[0] == 0:
+                xyz_valid = 0.0
             return {
-                'rgb': torch.from_numpy(img_patch).float() / 255.0,
-                'depth': data_depth,
-                'n_i': 0,
-                'has_depth': False,
-                'joint_img': torch.from_numpy(keypoints_2d.astype(np.float32)).float(),
-                'joint_3d': torch.from_numpy((joints_3d_np - joints_3d_np.mean(0)) / (self.cube_size[2] / 2.0)).float(),
+                'rgb': imgRGB,
+                'keypoints_2d': torch.from_numpy(keypoints_2d.astype(np.float32)).float(),
+                'keypoints_3d': torch.from_numpy((joints_3d_np - joints_3d_np.mean(0)) / (self.cube_size[2] / 2.0)).float(),
                 'joints_3d_gt': torch.from_numpy(joints_3d_np).float(),
+                'mano_params': aug_mano_params,
                 'mano_pose': torch.from_numpy(mano_pose).float(),
                 'mano_shape': torch.from_numpy(mano_shape).float(),
                 'mano_trans': torch.from_numpy(mano_trans).float(),
                 'cam_param': torch.from_numpy(np.array(cam_para)).float(),
-                'center': torch.from_numpy(center_xyz).float(),
-                'M': torch.eye(3).float(),
-                'cube': torch.from_numpy(np.array(self.cube_size)).float(),
+                'box_center': torch.from_numpy(center.astype(np.float32)),
+                'box_size': torch.tensor(bbox_size, dtype=torch.float32),
+                'bbox_expand_factor': torch.tensor(bbox_expand_factor, dtype=torch.float32),
+                '_scale': torch.from_numpy(scale_norm.astype(np.float32)),
+                'mano_params_is_axis_angle': {
+                    'global_orient': True,
+                    'hand_pose': True,
+                    'betas': False
+                },
+                'uv_valid': torch.from_numpy(uv_valid.astype(np.float32)),
+                'xyz_valid': torch.tensor(xyz_valid, dtype=torch.float32),
                 'hand_type': 'right',
                 'is_right': 1.0
             }
         
-        # Crop depth
-        if has_depth:
-            depth_crop, trans = self.Crop_Image_deep_pp(depth, center_uvd, self.cube_size, 
-                                                        (self.img_size, self.img_size), cam_para)
-        else:
-            depth_crop = np.zeros((self.img_size, self.img_size), dtype=np.float32)
-            trans = np.eye(3)
-        
-        # Crop RGB
-        if rgb is not None:
-            rgb_crop, trans_rgb = self.Crop_Image_deep_pp_RGB(copy.deepcopy(rgb), center_uvd, self.cube_size,
-                                                              (self.img_size, self.img_size), cam_para)
-        else:
-            rgb_crop = np.zeros((self.img_size, self.img_size, 3), dtype=np.float32)
-            trans_rgb = np.eye(3)
-        
-        # Augmentation
-        if self.data_split == 'train' and self.train:
-            # Apply geometric augmentation with probability aug_prob
-            if random.random() < self.aug_prob:
-                mode, off, rot, sc = self.rand_augment()
-            else:
-                # No geometric augmentation
-                # mode = 3 corresponds to 'none' in self.aug_modes = ['rot', 'com', 'sc', 'none']
-                mode = 3
-                off = np.array([0, 0, 0])  # Must be numpy array, same shape as rand_augment() returns
-                rot = 0
-                sc = 1.0
-            
-            if has_depth:
-                imgD, _, curLabel, cube, com2D, M, _ = self.augmentCrop(
-                    depth_crop, gt3Dcrop, center_uvd, self.cube_size, trans, mode, off, rot, sc, cam_para)
-            else:
-                imgD = np.zeros((self.img_size, self.img_size), dtype=np.float32)
-                curLabel = gt3Dcrop / (self.cube_size[2] / 2.0)
-                cube = np.array(self.cube_size)
-                com2D = center_uvd
-                M = trans
-            
-            if rgb is not None:
-                imgRGB, _, curLabel_rgb, cube_rgb, com2D_rgb, M_rgb, _ = self.augmentCrop_RGB(
-                    rgb_crop, gt3Dcrop, center_uvd, self.cube_size, trans_rgb, mode, off, rot, sc, cam_para)
-                
-                # Apply color augmentation with probability color_aug_prob
-                if self.color_factor != 0 and random.random() < self.color_aug_prob:
-                    # RGB augment (WiLoR style)
-                    c_up = 1.0 + self.color_factor
-                    c_low = 1.0 - self.color_factor
-                    color_scale = np.array(
-                        [random.uniform(c_low, c_up), random.uniform(c_low, c_up), random.uniform(c_low, c_up)])
-                    imgRGB = np.clip(imgRGB * color_scale[None, None, :], 0, 255)
-                
-                # Output RGB in [0,1] for GPGFormer (model handles WiLoR normalization internally).
-                imgRGB = torch.from_numpy(imgRGB[:, :, ::-1].copy()).permute(2, 0, 1).float() / 255.0
-            else:
-                imgRGB = torch.zeros((3, self.img_size, self.img_size))
-            
-            curLabel = curLabel / (cube[2] / 2.0)
-        else:
-            # Test mode
-            if has_depth:
-                imgD = self.normalize_img(depth_crop.max(), depth_crop, center_xyz, self.cube_size)
-            else:
-                imgD = np.zeros((self.img_size, self.img_size), dtype=np.float32)
-            
-            if rgb is not None:
-                imgRGB = torch.from_numpy(rgb_crop[:, :, ::-1].copy()).permute(2, 0, 1).float() / 255.0
-            else:
-                imgRGB = torch.zeros((3, self.img_size, self.img_size))
-            
-            curLabel = gt3Dcrop / (self.cube_size[2] / 2.0)
-            cube = np.array(self.cube_size)
-            com2D = center_uvd
-            M = trans
-        
-        com3D = self.jointImgTo3D(com2D, cam_para)
-        joint_img = transformPoints2D(self.joint3DToImg(curLabel * (cube[0] / 2.0) + com3D, cam_para), M)
-        # WiLoR normalization: keypoints_2d = keypoints_2d / patch_width - 0.5
-        # This normalizes to [-0.5, 0.5] range instead of [-1, 1]
-        joint_img[:, 0:2] = joint_img[:, 0:2] / self.img_size - 0.5
-        joint_img[:, 2] = (joint_img[:, 2] - com3D[2]) / (cube[0] / 2.0)
-        
-        # Convert to tensors
-        data_depth = torch.from_numpy(imgD).float().unsqueeze(0)  # (1, H, W)
-        data_rgb = imgRGB  # (3, H, W)
-        joint_img = torch.from_numpy(joint_img).float()  # (21, 3)
-        joint = torch.from_numpy(curLabel).float()  # (21, 3)
-        center = torch.from_numpy(com3D).float()  # (3,)
-        M_tensor = torch.from_numpy(M).float()  # (3, 3)
-        cube_tensor = torch.from_numpy(cube).float()  # (3,)
-        cam_para_tensor = torch.from_numpy(np.array(cam_para)).float()  # (4,)
-        
-        # MANO parameters
-        # 'val' split is carved from train.txt and has GT MANO parameters.
-        if self.data_split in ('train', 'val', 'test', 'train_all'):
-            mano_pose_tensor = torch.from_numpy(data['mano_pose']).float()  # (48,)
-            mano_shape_tensor = torch.from_numpy(data['mano_shape']).float()  # (10,)
-            mano_trans_tensor = torch.from_numpy(data['mano_trans']).float()  # (3,)
-        else:
-            # Dummy values for other splits
-            mano_pose_tensor = torch.zeros(48).float()
-            mano_shape_tensor = torch.zeros(10).float()
-            mano_trans_tensor = torch.zeros(3).float()
-        
-        # Ground truth joints
-        joints_3d_gt = torch.from_numpy(joint_xyz).float()  # (21, 3)
-        
-        return {
-            'rgb': data_rgb,  # (3, H, W)
-            'depth': data_depth,  # (1, H, W)
-            'n_i': n_i,  # modality flag: 0 or 1
-            'has_depth': has_depth,  # whether depth exists
-            'joint_img': joint_img,  # (21, 3) normalized joint image coordinates
-            'joint_3d': joint,  # (21, 3) normalized joint 3D coordinates
-            'joints_3d_gt': joints_3d_gt,  # (21, 3) absolute joint 3D coordinates
-            'mano_pose': mano_pose_tensor,  # (48,)
-            'mano_shape': mano_shape_tensor,  # (10,)
-            'mano_trans': mano_trans_tensor,  # (3,)
-            'cam_param': cam_para_tensor,  # (4,)
-            'center': center,  # (3,)
-            'M': M_tensor,  # (3, 3)
-            'cube': cube_tensor,  # (3,)
-            'hand_type': 'right',  # HO3D is right hand only
-            'is_right': 1.0
-        }
+        raise NotImplementedError("HO3D RGB-only path requires align_wilor_aug=True.")
+
+
+# HO3D to MANO joint mapping (moved from commented section at top)
+HO3D2MANO = [0,
+             1, 2, 3,
+             4, 5, 6,
+             7, 8, 9,
+             10, 11, 12,
+             13, 14, 15,
+             17,
+             18,
+             20,
+             19,
+             16]
+
+# Import WILOR_JOINT_MAP from utils
+from .utils import WILOR_JOINT_MAP
+
+
+def main():
+    """Debug/inspect HO3DDataset by printing a few samples."""
+    import argparse
+    from pprint import pformat
+
+    def _describe_value(x, max_list_items: int = 8, max_str_len: int = 200) -> str:
+        if isinstance(x, torch.Tensor):
+            x_det = x.detach()
+            desc = f"torch.Tensor(shape={tuple(x_det.shape)}, dtype={x_det.dtype}, device={x_det.device})"
+            if x_det.numel() > 0 and x_det.is_floating_point():
+                desc += f", min={x_det.min().item():.4g}, max={x_det.max().item():.4g}"
+            return desc
+        if isinstance(x, np.ndarray):
+            desc = f"np.ndarray(shape={x.shape}, dtype={x.dtype})"
+            if x.size > 0 and np.issubdtype(x.dtype, np.floating):
+                desc += f", min={np.nanmin(x):.4g}, max={np.nanmax(x):.4g}"
+            return desc
+        if isinstance(x, (int, float, bool, np.number)):
+            return f"{type(x).__name__}({x})"
+        if isinstance(x, str):
+            s = x if len(x) <= max_str_len else x[:max_str_len] + "..."
+            return f"str(len={len(x)}): {s!r}"
+        if isinstance(x, (list, tuple)):
+            head = list(x[:max_list_items])
+            more = "" if len(x) <= max_list_items else f", ... (+{len(x)-max_list_items} more)"
+            return f"{type(x).__name__}(len={len(x)}): {head!r}{more}"
+        if isinstance(x, dict):
+            return f"dict(keys={list(x.keys())})"
+        return f"{type(x).__name__}"
+
+    parser = argparse.ArgumentParser(description="Print/inspect HO3DDataset contents.")
+    parser.add_argument("--root-dir", type=str, required=True, help="Path to HO3D root directory.")
+    parser.add_argument("--split", type=str, default="train", choices=["train", "val", "test", "evaluation", "train_all"], help="Dataset split.")
+    parser.add_argument("--img-size", type=int, default=256, help="Output image size.")
+    parser.add_argument("--center-jitter", type=float, default=0.05, help="Center jitter factor.")
+    parser.add_argument("--num-samples", type=int, default=3, help="How many samples to print.")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed.")
+    args = parser.parse_args()
+
+    ds = HO3DDataset(
+        data_split=args.split,
+        root_dir=args.root_dir,
+        img_size=args.img_size,
+        train=(args.split == 'train'),
+        align_wilor_aug=True,
+        center_jitter_factor=args.center_jitter,
+    )
+
+    print("\n=== HO3DDataset summary ===")
+    print(f"split={ds.data_split}, len={len(ds)}")
+    print(f"root_dir={ds.root_dir}")
+    print(f"center_jitter_factor={ds.center_jitter_factor}")
+    print("=======================\n")
+
+    random.seed(args.seed)
+    n = min(args.num_samples, len(ds))
+    indices = random.sample(range(len(ds)), k=n) if n > 0 else []
+
+    for i, idx in enumerate(indices):
+        print(f"\n--- Sample {i+1}/{len(indices)} | idx={idx} ---")
+        sample = ds[idx]
+        for k in sorted(sample.keys()):
+            v = sample[k]
+            print(f"{k}: {_describe_value(v)}")
+
+
+if __name__ == "__main__":
+    main()
+

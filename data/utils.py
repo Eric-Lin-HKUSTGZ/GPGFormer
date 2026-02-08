@@ -139,10 +139,15 @@ def keypoint_3d_processing(keypoints_3d: np.array, flip_permutation: List[int],
         sn, cs = np.sin(rot_rad), np.cos(rot_rad)
         rot_mat[0, :2] = [cs, -sn]
         rot_mat[1, :2] = [sn, cs]
-    keypoints_3d[:, :-1] = np.einsum('ij,kj->ki', rot_mat, keypoints_3d[:, :-1])
+    if keypoints_3d.shape[1] >= 4:
+        keypoints_3d[:, :3] = np.einsum('ij,kj->ki', rot_mat, keypoints_3d[:, :3])
+    else:
+        keypoints_3d = np.einsum('ij,kj->ki', rot_mat, keypoints_3d[:, :3])
     return keypoints_3d.astype(np.float32)
 
 
+# 把 MANO 的轴角（axis-angle / Rodrigues 向量）姿态参数按数据增强的“图像平面旋转角 rot”同步旋转，
+# 从而保证“图像旋转了多少，手的全局朝向（global_orient）也跟着在相机坐标里转多少”，两者保持一致。
 def rot_aa(aa: np.array, rot: float) -> np.array:
     R = np.array([[np.cos(np.deg2rad(-rot)), -np.sin(np.deg2rad(-rot)), 0],
                   [np.sin(np.deg2rad(-rot)), np.cos(np.deg2rad(-rot)), 0],
@@ -190,9 +195,12 @@ def get_example(img: np.array, center_x: float, center_y: float,
         scale, rot, do_flip, _, _, color_scale, tx, ty = do_augmentation(augm_config)
     else:
         scale, rot, do_flip, _, _, color_scale, tx, ty = 1.0, 0.0, False, False, 0, [1.0, 1.0, 1.0], 0.0, 0.0
-
+    # 左手翻转为右手
     if not is_right:
         do_flip = True
+
+    if width < 1 or height < 1:
+        breakpoint()
 
     center_x += width * tx
     center_y += height * ty
@@ -221,7 +229,9 @@ def get_example(img: np.array, center_x: float, center_y: float,
 
     for n_jt in range(len(keypoints_2d)):
         keypoints_2d[n_jt, 0:2] = trans_point2d(keypoints_2d[n_jt, 0:2], trans)
-    keypoints_2d[:, :-1] = keypoints_2d[:, :-1] / patch_width - 0.5
+    # Normalize to [-0.5, 0.5] using per-axis patch size (supports non-square patches)
+    keypoints_2d[:, 0] = keypoints_2d[:, 0] / patch_width - 0.5
+    keypoints_2d[:, 1] = keypoints_2d[:, 1] / patch_height - 0.5
 
     if not return_trans:
         return img_patch, keypoints_2d, keypoints_3d, mano_params, has_mano_params, img_size

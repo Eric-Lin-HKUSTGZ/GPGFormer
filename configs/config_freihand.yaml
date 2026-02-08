@@ -1,15 +1,21 @@
 dataset:
   name: freihand
   img_size: 256
+  # Root joint index used for all root-relative ops (loss/eval). Default: 9 (middle MCP, FreiHAND convention).
+  root_index: 9
+  # Use training set split for validation (9:1)
+  use_trainval_split: false
+  trainval_ratio: 0.9
+  trainval_seed: 42
   align_wilor_aug: true
   # Train uses GT bbox (from keypoints); eval/test uses detector bbox
   bbox_source_eval: detector
   wilor_aug_config:
-    SCALE_FACTOR: 0.3
-    ROT_FACTOR: 30
+    SCALE_FACTOR: 0.3 
+    ROT_FACTOR: 30 # 30
     TRANS_FACTOR: 0.02
-    COLOR_SCALE: 0.2
-    ROT_AUG_RATE: 0.6
+    COLOR_SCALE: 0.2 # 0.2
+    ROT_AUG_RATE: 0.6 # 0.6
     TRANS_AUG_RATE: 0.5
     DO_FLIP: false
     FLIP_AUG_RATE: 0.0
@@ -17,17 +23,26 @@ dataset:
     EXTREME_CROP_AUG_LEVEL: 1
 
 paths:
-  freihand_root: /data1/users/Robert/datasets/FreiHAND_pub_v2
-  freihand_eval_root: /data1/users/Robert/datasets/FreiHAND_pub_v2_eval
-  wilor_ckpt: /data0/users/Robert/linweiquan/GPGFormer/weights/wilor/wilor_final.ckpt
-  detector_ckpt: /data0/users/Robert/linweiquan/GPGFormer/weights/wilor/detector.pt
-  moge2_ckpt: /data0/users/Robert/linweiquan/GPGFormer/weights/moge2/model.pt
-  mano_dir: /data0/users/Robert/linweiquan/GPGFormer/weights/mano
-  mano_mean_params: /data0/users/Robert/linweiquan/GPGFormer/weights/mano/mano_mean_params.npz
+  freihand_root: /root/code/vepfs/dataset/FreiHAND_pub_v2
+  freihand_eval_root: /root/code/vepfs/dataset/FreiHAND_pub_v2_eval
+  wilor_ckpt: /root/code/vepfs/GPGFormer/weights/wilor_final.ckpt
+  detector_ckpt: /root/code/vepfs/GPGFormer/weights/detector.pt
+  moge2_ckpt: /root/code/vepfs/GPGFormer/weights/model.pt
+  mano_dir: /root/code/vepfs/GPGFormer/weights/mano
+  mano_mean_params: /root/code/vepfs/GPGFormer/weights/mano/mano_mean_params.npz
 
 model:
   image_size: 256
   focal_length: 5000
+  # Token fusion mode: concat (concatenate tokens) or sum (element-wise sum)
+  token_fusion_mode: sum # concat | sum
+  # Sum fusion strategy (only used when token_fusion_mode=sum)
+  # Options: basic | weighted | normalized | weighted_normalized | channel_concat
+  # - channel_concat: Token-wise channel concatenation + projection (preserves info, learns alignment)
+  sum_fusion_strategy: channel_concat
+  # MANO decoder selection for FreiHAND (align with FreiHAND toolbox)
+  mano_decoder: wilor # wilor | freihand_legacy
+  freihand_mano_root: /root/code/hand_reconstruction/freihand/data
   mano_head:
     # HaMeR-style MANO head (cross-attn TransformerDecoder + IEF)
     ief_iters: 3
@@ -38,27 +53,60 @@ model:
     dim_head: 64
     mlp_dim: 2048
     dropout: 0.0
+  # Feature Refiner: Lightweight feature refinement module
+  # Methods: 'sjta', 'coear', 'kcr', 'none'
+  # - sjta: Sparse Joint Token Adapter (cross-attention based, ~1M params)
+  # - coear: Convolutional Edge/High-frequency Augmentation Refiner (~20K params)
+  # - kcr: Keypoint Consistency Refinement (2D keypoint driven, ~50K params)
+  # - none: Disable feature refinement
+  feature_refiner:
+    method: none  # Options: sjta, coear, kcr, none
+    feat_dim: 1280
+    # SJTA settings
+    sjta_bottleneck_dim: 256
+    sjta_num_heads: 4
+    sjta_use_2d_prior: true
+    # COEAR settings
+    coear_dilation1: 1
+    coear_dilation2: 2
+    coear_gate_reduction: 8
+    coear_init_alpha: 0.1
+    # KCR settings
+    kcr_num_keypoints: 21
+    kcr_hidden_dim: 128
 
 loss:
   reduction: mean
-  w_2d: 5.0
-  w_3d_joint: 1.0
-  w_3d_vert: 0.5
-  w_global_orient: 10.0
-  w_hand_pose: 10.0
+  w_2d: 1.0
+  w_3d_joint: 5.0
+  # w_3d_vert: 0.5
+  w_global_orient: 1.0
+  w_hand_pose: 1.0
   w_scale: 0.0
+  # w_3d_joint: 0.05
+  # w_2d: 0.01
+  # w_global_orient: 0.001
+  # w_hand_pose: 0.001
+  # w_scale: 0.0
 
 train:
   use_cuda: true
   epochs: 50
-  batch_size: 16
-  val_batch_size: 16
-  lr: 5e-5
+  batch_size: 2
+  val_batch_size: 2
+  lr: 2e-5
   weight_decay: 1e-4
   warmup_epochs: 5
   min_lr: 0.0
-  num_workers: 8
-  out_dir: checkpoints/freihand_20260111
+  # Gradient clipping for training stability
+  grad_clip_norm: 1.0
+  # Exponential Moving Average (EMA) for model parameters
+  use_ema: false
+  ema_decay: 0.9999
+  # Whether to run train-set metrics after each epoch
+  eval_train_metrics: false #打印训练集的指标
+  num_workers: 16
+  out_dir: /root/code/vepfs/GPGFormer/checkpoints/freihand_20260207_feat
 
 
 

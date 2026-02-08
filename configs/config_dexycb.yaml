@@ -1,6 +1,8 @@
 dataset:
   name: dexycb
   img_size: 256
+  # Root joint index used for all root-relative ops (loss/eval). Default: 9 (middle MCP).
+  root_index: 9
   dexycb_setup: s0
   align_wilor_aug: true
   bbox_source_eval: detector
@@ -17,16 +19,22 @@ dataset:
     EXTREME_CROP_AUG_LEVEL: 1
 
 paths:
-  dexycb_root: /data1/users/Robert/datasets/dex-ycb
-  wilor_ckpt: /data0/users/Robert/linweiquan/GPGFormer/weights/wilor/wilor_final.ckpt
-  detector_ckpt: /data0/users/Robert/linweiquan/GPGFormer/weights/wilor/detector.pt
-  moge2_ckpt: /data0/users/Robert/linweiquan/GPGFormer/weights/moge2/model.pt
-  mano_dir: /data0/users/Robert/linweiquan/GPGFormer/weights/mano
-  mano_mean_params: /data0/users/Robert/linweiquan/GPGFormer/weights/mano/mano_mean_params.npz
+  dexycb_root: /root/code/vepfs/dataset/dex-ycb
+  wilor_ckpt: /root/code/hand_reconstruction/GPGFormer/weights/wilor_final.ckpt
+  detector_ckpt: /root/code/hand_reconstruction/GPGFormer/weights/detector.pt
+  moge2_ckpt: /root/code/hand_reconstruction/GPGFormer/weights/model.pt
+  mano_dir: /root/code/hand_reconstruction/GPGFormer/weights/mano
+  mano_mean_params: /root/code/hand_reconstruction/GPGFormer/weights/mano/mano_mean_params.npz
 
 model:
   image_size: 256
   focal_length: 5000
+  # Token fusion mode: concat (concatenate tokens) or sum (element-wise sum)
+  token_fusion_mode: sum # concat | sum
+  # Sum fusion strategy (only used when token_fusion_mode=sum)
+  # Options: basic | weighted | normalized | weighted_normalized | channel_concat
+  # - channel_concat: Token-wise channel concatenation + projection (preserves info, learns alignment)
+  sum_fusion_strategy: basic
   mano_head:
     # HaMeR-style MANO head (cross-attn TransformerDecoder + IEF)
     ief_iters: 3
@@ -37,6 +45,19 @@ model:
     dim_head: 64
     mlp_dim: 2048
     dropout: 0.0
+  # Feature Refiner: Lightweight feature refinement module
+  feature_refiner:
+    method: none  # Options: sjta, coear, kcr, none
+    feat_dim: 1280
+    sjta_bottleneck_dim: 256
+    sjta_num_heads: 4
+    sjta_use_2d_prior: true
+    coear_dilation1: 1
+    coear_dilation2: 2
+    coear_gate_reduction: 8
+    coear_init_alpha: 0.1
+    kcr_num_keypoints: 21
+    kcr_hidden_dim: 128
 
 loss:
   reduction: mean
@@ -56,6 +77,11 @@ train:
   weight_decay: 1.0e-4
   warmup_epochs: 5
   min_lr: 0.0
+  # Gradient clipping for training stability
+  grad_clip_norm: 1.0
+  # Exponential Moving Average (EMA) for model parameters
+  use_ema: true
+  ema_decay: 0.9999
   num_workers: 4
   out_dir: checkpoints
 

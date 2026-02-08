@@ -21,8 +21,9 @@ def compute_similarity_transform(S1: torch.Tensor, S2: torch.Tensor) -> torch.Te
         (torch.Tensor): The first set of points after applying the similarity transformation.
     """
     batch_size = S1.shape[0]
-    S1 = S1.permute(0, 2, 1)  # (B, 3, N)
-    S2 = S2.permute(0, 2, 1)  # (B, 3, N)
+    # Use float64 for numerical stability (near-identical points can cause drift in float32).
+    S1 = S1.to(dtype=torch.float64).permute(0, 2, 1)  # (B, 3, N)
+    S2 = S2.to(dtype=torch.float64).permute(0, 2, 1)  # (B, 3, N)
     
     # 1. Remove mean.
     mu1 = S1.mean(dim=2, keepdim=True)  # (B, 3, 1)
@@ -37,29 +38,19 @@ def compute_similarity_transform(S1: torch.Tensor, S2: torch.Tensor) -> torch.Te
     # 3. The outer product of X1 and X2.
     K = torch.matmul(X1, X2.permute(0, 2, 1))  # (B, 3, 3)
 
-    # 4. Solution that Maximizes trace(R'K) is R=U*V', where U, V are singular vectors of K.
+    # 4. SVD-based solution for rotation
     try:
-        U, s, V = torch.svd(K)
-    except:
-        # Fallback for older PyTorch versions
         U, s, Vh = torch.linalg.svd(K)
         V = Vh.permute(0, 2, 1)
-    
-    Vh = V.permute(0, 2, 1)  # (B, 3, 3)
+    except Exception:  # pragma: no cover
+        U, s, V = torch.svd(K)
+        Vh = V.permute(0, 2, 1)
 
-    # Construct Z that fixes the orientation of R to get det(R)=1.
-    Z = torch.eye(U.shape[1], device=U.device, dtype=U.dtype).unsqueeze(0).repeat(batch_size, 1, 1)  # (B, 3, 3)
-    # Compute determinant
-    try:
-        det = torch.linalg.det(torch.matmul(U, Vh))
-    except:
-        # Fallback for older PyTorch versions
-        UVh = torch.matmul(U, Vh)
-        det = torch.det(UVh)
+    # Fix improper rotation
+    Z = torch.eye(U.shape[1], device=U.device, dtype=U.dtype).unsqueeze(0).repeat(batch_size, 1, 1)
+    det = torch.det(torch.matmul(U, Vh))
     Z[:, -1, -1] *= torch.sign(det)
-
-    # Construct R.
-    R = torch.matmul(torch.matmul(V, Z), U.permute(0, 2, 1))  # (B, 3, 3)
+    R = torch.matmul(torch.matmul(V, Z), U.permute(0, 2, 1))
 
     # 5. Recover scale.
     trace = torch.matmul(R, K).diagonal(offset=0, dim1=-1, dim2=-2).sum(dim=-1)  # (B,)
@@ -71,7 +62,7 @@ def compute_similarity_transform(S1: torch.Tensor, S2: torch.Tensor) -> torch.Te
     # 7. Apply transformation.
     S1_hat = scale * torch.matmul(R, S1) + t  # (B, 3, N)
 
-    return S1_hat.permute(0, 2, 1)  # (B, N, 3)
+    return S1_hat.permute(0, 2, 1)  # (B, N, 3) in float64
 
 
 def compute_mpjpe(pred_joints: torch.Tensor, gt_joints: torch.Tensor) -> np.ndarray:
@@ -118,8 +109,8 @@ def compute_mpjpe(pred_joints: torch.Tensor, gt_joints: torch.Tensor) -> np.ndar
 
 def compute_pa_mpjpe(pred_joints: torch.Tensor, gt_joints: torch.Tensor) -> np.ndarray:
     """
-    Compute Procrustes Aligned Mean Per Joint Position Error (PA-MPJPE) in mm.
-    Guard against degenerate cases (zero variance) to avoid NaN.
+    Compute Procrustes Aligned Mean Per Joint Position Error (PA-MPJPE).
+    Units follow the input (e.g., mm in -> mm out).
     """
     # Handle single sample case
     if pred_joints.dim() == 2:

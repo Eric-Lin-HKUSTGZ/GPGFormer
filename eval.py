@@ -73,6 +73,9 @@ def build_dataset(cfg: dict):
             wilor_aug_config=cfg["dataset"].get("wilor_aug_config", {}),
             bbox_source=bbox_source,
             detector_weights_path=detector_path,
+            use_trainval_split=bool(cfg["dataset"].get("use_trainval_split", True)),
+            trainval_ratio=float(cfg["dataset"].get("trainval_ratio", 0.9)),
+            trainval_seed=int(cfg["dataset"].get("trainval_seed", 42)),
         )
 
     raise ValueError(f"Unknown dataset.name: {cfg['dataset']['name']}")
@@ -115,6 +118,8 @@ def main():
             moge2_weights_path=cfg["paths"]["moge2_ckpt"],
             mano_model_path=cfg["paths"]["mano_dir"],
             mano_mean_params=cfg["paths"]["mano_mean_params"],
+            mano_decoder=str(cfg["model"].get("mano_decoder", "wilor")),
+            freihand_mano_root=cfg["model"].get("freihand_mano_root", None),
             focal_length=float(cfg["model"].get("focal_length", 5000.0)),
             mano_head_ief_iters=int(cfg["model"].get("mano_head", {}).get("ief_iters", 3)),
             mano_head_transformer_input=str(cfg["model"].get("mano_head", {}).get("transformer_input", "mean_shape")),
@@ -124,6 +129,9 @@ def main():
             mano_head_dim_head=int(cfg["model"].get("mano_head", {}).get("dim_head", 64)),
             mano_head_mlp_dim=int(cfg["model"].get("mano_head", {}).get("mlp_dim", 2048)),
             mano_head_dropout=float(cfg["model"].get("mano_head", {}).get("dropout", 0.0)),
+            moge2_num_tokens=int(cfg["model"].get("moge2_num_tokens", 400)),
+            token_fusion_mode=str(cfg["model"].get("token_fusion_mode", "concat")),
+            sum_fusion_strategy=str(cfg["model"].get("sum_fusion_strategy", "basic")),
         )
     ).to(device)
 

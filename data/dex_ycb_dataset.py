@@ -15,18 +15,17 @@ import torch
 from torch.utils.data import Dataset
 import torchvision.transforms as transforms
 from scipy import ndimage
-from .wilor_utils import WILOR_JOINT_MAP
-
-# DexYCB to MANO joint mapping
-DexYCB2MANO = [
-    0,
-    5, 6, 7,
-    9, 10, 11,
-    17, 18, 19,
-    13, 14, 15,
-    1, 2, 3,
-    8, 12, 20, 16, 4
-]
+from .utils import WILOR_JOINT_MAP, get_bbox, get_example
+# # DexYCB to MANO joint mapping
+# DexYCB2MANO = [
+#     0,
+#     5, 6, 7,
+#     9, 10, 11,
+#     17, 18, 19,
+#     13, 14, 15,
+#     1, 2, 3,
+#     8, 12, 20, 16, 4
+# ]
 
 
 def transformPoint2D(pt, M):
@@ -57,32 +56,23 @@ def rotatePoint2D(p1, center, angle):
     return ps
 
 
-def sample_modality(has_depth, p_drop=0.4):
-    """
-    Random modality sampling (OmniVGGT style)
-    Args:
-        has_depth: whether the sample has depth
-        p_drop: probability to drop depth (0.3-0.5)
-    Returns:
-        n_i: 0 if depth is dropped, 1 if depth is kept
-    """
-    if has_depth:
-        n_i = 0 if random.random() < p_drop else 1
-    else:
-        n_i = 0
-    return n_i
-
-
 class DexYCBDataset(Dataset):
     """
     Dex-YCB Dataset with random modality sampling
     """
-    def __init__(self, setup, split, root_dir, img_size=256, aug_para=[10, 0.2, 30], 
-                 input_modal='RGBD', p_drop=0.4, train=True, color_factor=0.2, 
+    def __init__(self, setup, split, root_dir, img_size=256, aug_para=[10, 0.2, 30],
+                 input_modal='RGBD', p_drop=0.4, train=True, color_factor=0.2,
                  aug_prob=0.8, color_aug_prob=0.6, align_wilor_aug=False,
                  wilor_aug_config=None,
                  bbox_source: str = "gt",
-                 detector_weights_path: str | None = None):
+                 detector_weights_path: str | None = None,
+                 root_index: int = 9,
+                 # New augmentation parameters (align with FreiHANDDatasetV2)
+                 center_jitter_factor: float = 0.05,
+                 brightness_limit: tuple = (-0.2, 0.1),
+                 contrast_limit: tuple = (0.8, 1.2),
+                 brightness_prob: float = 0.5,
+                 contrast_prob: float = 0.5):
         """
         Args:
             setup: dataset setup (e.g., 's0')
@@ -98,6 +88,7 @@ class DexYCBDataset(Dataset):
             color_aug_prob: probability to apply color augmentation
         """
         self.setup = setup
+        self.root_index = int(root_index)
         if split == 'val':
             split = 'test'
         self.split = split
@@ -109,8 +100,11 @@ class DexYCBDataset(Dataset):
         else:
             self.dex_ycb_root = self.root_dir
         self.annot_path = osp.join(self.dex_ycb_root, 'annotations')
-        self.input_modal = input_modal
+        self.input_modal = "RGB"
         self.img_size = img_size
+        # WiLoR ViT expects 256x192; keep height=img_size, width=0.75*img_size
+        self.patch_height = self.img_size
+        self.patch_width = int(round(self.img_size * 0.75))
         self.aug_para = aug_para
         self.cube_size = [250, 250, 250]
         self.aug_modes = ['rot', 'com', 'sc', 'none']
@@ -122,18 +116,25 @@ class DexYCBDataset(Dataset):
         self.color_aug_prob = color_aug_prob
         self.align_wilor_aug = align_wilor_aug
         self.wilor_aug_config = wilor_aug_config or {}
+
+        # New augmentation parameters (align with FreiHANDDatasetV2)
+        self.center_jitter_factor = float(center_jitter_factor)
+        self.brightness_limit = brightness_limit
+        self.contrast_limit = contrast_limit
+        self.brightness_prob = float(brightness_prob)
+        self.contrast_prob = float(contrast_prob)
+
         self.bbox_source = str(bbox_source).lower()
         self.detector = None
-        if self.bbox_source == "detector" and (not self.train):
-            if detector_weights_path is None:
-                raise ValueError("bbox_source='detector' requires detector_weights_path")
-            from gpgformer.models.detector.wilor_yolo import WiLoRDetectorConfig, WiLoRYOLODetector
-            self.detector = WiLoRYOLODetector(WiLoRDetectorConfig(weights_path=detector_weights_path))
-        # WiLoR uses ImageNet normalization: (img - mean) / std
-        # mean = 255 * [0.485, 0.456, 0.406], std = 255 * [0.229, 0.224, 0.225]
-        self.mean = 255. * np.array([0.485, 0.456, 0.406])  # ImageNet mean
-        self.std = 255. * np.array([0.229, 0.224, 0.225])  # ImageNet std
-        self.transform = transforms.ToTensor()  # Converts to CHW and float32
+        # if self.bbox_source == "detector" and (not self.train):
+        #     if detector_weights_path is None:
+        #         raise ValueError("bbox_source='detector' requires detector_weights_path")
+        #     from gpgformer.models.detector.wilor_yolo import WiLoRDetectorConfig, WiLoRYOLODetector
+        #     self.detector = WiLoRYOLODetector(WiLoRDetectorConfig(weights_path=detector_weights_path))
+        # WiLoR uses ImageNet normalization (align with FreiHANDDatasetV2)
+        self.transform = transforms.ToTensor()
+        self.imagenet_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+        self.imagenet_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
         
         self.datalist = self.load_data()
         print(f'Loaded {len(self.datalist)} samples from Dex-YCB {setup} {split}')
@@ -222,75 +223,6 @@ class DexYCBDataset(Dataset):
             }
             datalist.append(data)
         return datalist
-
-    def _label_path_from_image(self, img_path):
-        label_path = img_path.replace('color_', 'labels_')
-        label_path = osp.splitext(label_path)[0] + '.npz'
-        return label_path
-
-    def _load_label_npz(self, img_path):
-        label_path = self._label_path_from_image(img_path)
-        if not osp.exists(label_path):
-            return None
-        try:
-            with np.load(label_path) as data:
-                return {k: data[k] for k in data.files}
-        except Exception:
-            return None
-
-    def _compute_crop_center_from_labels(self, label_data, depth, img_shape, cam_para):
-        if label_data is None:
-            return None, None
-
-        seg = label_data.get('seg')
-        mask = seg == 255 if seg is not None else None
-
-        joints_3d = label_data.get('joint_3d')
-        if joints_3d is not None and joints_3d.size > 0:
-            if joints_3d.ndim == 3:
-                joints_3d = joints_3d[0]
-            valid = np.isfinite(joints_3d).all(axis=1)
-            if np.any(valid):
-                # labels_*.npz joint_3d is in meters; convert to mm to match cube_size/depth units.
-                center_xyz = (joints_3d[valid].mean(axis=0) * 1000.0).astype(np.float32)
-                center_uvd = self.joint3DToImg(center_xyz, cam_para)
-                return center_uvd.astype(np.float32), center_xyz
-
-        joints_2d = label_data.get('joint_2d')
-        if joints_2d is not None and joints_2d.size > 0:
-            if joints_2d.ndim == 3:
-                joints_2d = joints_2d[0]
-            valid = np.isfinite(joints_2d).all(axis=1)
-            if np.any(valid):
-                cx = float(joints_2d[valid, 0].mean())
-                cy = float(joints_2d[valid, 1].mean())
-            else:
-                cx = cy = None
-        else:
-            cx = cy = None
-
-        if mask is not None and np.any(mask):
-            ys, xs = np.where(mask)
-            cx = float((xs.min() + xs.max()) / 2.0)
-            cy = float((ys.min() + ys.max()) / 2.0)
-
-        if cx is None or cy is None:
-            return None, None
-
-        z = 0.0
-        if depth is not None and depth.size > 0:
-            if mask is not None and np.any(mask):
-                depth_vals = depth[mask]
-                if depth_vals.size > 0:
-                    z = float(np.median(depth_vals))
-            else:
-                ix = int(np.clip(round(cx), 0, img_shape[1] - 1))
-                iy = int(np.clip(round(cy), 0, img_shape[0] - 1))
-                z = float(depth[iy, ix])
-
-        center_uvd = np.array([cx, cy, z], dtype=np.float32)
-        center_xyz = self.jointImgTo3D(center_uvd, cam_para)
-        return center_uvd, center_xyz
 
     def __len__(self):
         return len(self.datalist)
@@ -627,33 +559,15 @@ class DexYCBDataset(Dataset):
         hand_type = data['hand_type']
         do_flip = (hand_type == 'left')
         
-        # Load RGB
-        if 'RGB' in self.input_modal:
-            rgb = cv2.imread(img_path)
-            if not isinstance(rgb, np.ndarray):
-                raise IOError(f"Fail to read {img_path}")
-        else:
-            rgb = None
-
-        # Load Depth
-        depth_path = img_path.replace('color_', 'aligned_depth_to_color_').replace('jpg', 'png')
-        depth = cv2.imread(depth_path, cv2.IMREAD_ANYDEPTH)
-        has_depth = depth is not None and depth.size > 0
-        
-        # Random modality sampling (OmniVGGT style)
-        if self.train:
-            n_i = sample_modality(has_depth, self.p_drop)
-        else:
-            # During test, always use depth if available
-            n_i = 1 if has_depth else 0
+        # Load RGB only
+        rgb = cv2.imread(img_path)
+        if not isinstance(rgb, np.ndarray):
+            raise IOError(f"Fail to read {img_path}")
 
         intrinsics = data['cam_param']
         cam_para = (intrinsics['focal'][0], intrinsics['focal'][1], 
                    intrinsics['princpt'][0], intrinsics['princpt'][1])
-        label_data = self._load_label_npz(img_path)
-        label_center_uvd, label_center_xyz = self._compute_crop_center_from_labels(
-            label_data, depth, img_shape, cam_para
-        )
+        label_center_uvd, label_center_xyz = None, None
 
         joint_xyz = data['joints_coord_cam'].reshape([21, 3])[DexYCB2MANO, :] * 1000
         joint_uvd = self.joint3DToImg(joint_xyz, cam_para)
@@ -662,10 +576,7 @@ class DexYCBDataset(Dataset):
         mano_trans = data['mano_trans']
 
         if do_flip:
-            if rgb is not None:
-                rgb = rgb[:, ::-1].copy()
-            if has_depth:
-                depth = depth[:, ::-1].copy()
+            rgb = rgb[:, ::-1].copy()
             joint_uvd[:, 0] = img_shape[1] - joint_uvd[:, 0] - 1
             if label_center_uvd is not None:
                 label_center_uvd[0] = img_shape[1] - label_center_uvd[0] - 1
@@ -674,192 +585,215 @@ class DexYCBDataset(Dataset):
         joint_xyz = self.jointImgTo3D(joint_uvd, cam_para)
         joint_xyz = joint_xyz[WILOR_JOINT_MAP]
         joint_uvd = joint_uvd[WILOR_JOINT_MAP]
-        center_xyz = joint_xyz.mean(0)
-        center_uvd = self.joint3DToImg(center_xyz, cam_para)
-        if label_center_uvd is not None and label_center_xyz is not None:
-            center_uvd = label_center_uvd
-            center_xyz = label_center_xyz
-        gt3Dcrop = joint_xyz - center_xyz
+        # center_xyz = joint_xyz.mean(0)
+        # center_uvd = self.joint3DToImg(center_xyz, cam_para)
+        # if label_center_uvd is not None and label_center_xyz is not None:
+        #     center_uvd = label_center_uvd
+        #     center_xyz = label_center_xyz
+        
+        keypoints_2d = np.concatenate([joint_uvd[:, :2], np.ones((21, 1), dtype=np.float32)], axis=1)
+        keypoints_3d = np.concatenate([joint_xyz, np.ones((21, 1), dtype=np.float32)], axis=1)
+        # if self.bbox_source == "detector" and self.detector is not None:
+        #     bbox = self.detector(rgb)
+        #     if bbox is not None:
+        #         x1, y1, x2, y2 = bbox
+        #         center = np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0], dtype=np.float32)
+        #         scale = np.array([(x2 - x1) * 1.2, (y2 - y1) * 1.2], dtype=np.float32)
+        #     else:
+        #         center, scale = get_bbox(keypoints_2d, rescale=1.2)
+        # else:
+        center, scale = get_bbox(keypoints_2d, rescale=1.2)
+        if scale[0] < 1 or scale[1] < 1:
+            center = np.array([img_shape[1] / 2.0, img_shape[0] / 2.0], dtype=np.float32)
+            scale = np.array([img_shape[1], img_shape[0]], dtype=np.float32)
 
-        if self.align_wilor_aug and rgb is not None:
-            from .wilor_utils import get_bbox, get_example
-            keypoints_2d = np.concatenate([joint_uvd[:, :2], np.ones((21, 1), dtype=np.float32)], axis=1)
-            keypoints_3d = np.concatenate([joint_xyz, np.ones((21, 1), dtype=np.float32)], axis=1)
-            if self.bbox_source == "detector" and self.detector is not None:
-                bbox = self.detector(rgb)
-                if bbox is not None:
-                    x1, y1, x2, y2 = bbox
-                    center = np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0], dtype=np.float32)
-                    scale = np.array([(x2 - x1) * 1.2, (y2 - y1) * 1.2], dtype=np.float32)
-                else:
-                    center, scale = get_bbox(keypoints_2d, rescale=1.2)
-            else:
-                center, scale = get_bbox(keypoints_2d, rescale=1.2)
-            if scale[0] < 1 or scale[1] < 1:
-                center = np.array([img_shape[1] / 2.0, img_shape[0] / 2.0], dtype=np.float32)
-                scale = np.array([img_shape[1], img_shape[0]], dtype=np.float32)
-            mano_params = {
-                'global_orient': mano_pose[:3].copy(),
-                'hand_pose': mano_pose[3:].copy(),
-                'betas': mano_shape.copy()
-            }
-            has_mano_params = {
-                'global_orient': np.array([1.0], dtype=np.float32),
-                'hand_pose': np.array([1.0], dtype=np.float32),
-                'betas': np.array([1.0], dtype=np.float32)
-            }
-            flip_perm = list(range(21))
-            img_patch, keypoints_2d, keypoints_3d, aug_mano_params, _, _, trans = get_example(
-                rgb, center[0], center[1], scale[0], scale[1],
-                keypoints_2d, keypoints_3d, mano_params, has_mano_params,
-                flip_perm, self.img_size, self.img_size,
-                None, None,
-                do_augment=self.train, is_right=(hand_type == 'right'),
-                augm_config=self.wilor_aug_config, is_bgr=True,
-                return_trans=True
-            )
-            imgRGB = torch.from_numpy(img_patch).float() / 255.0
-            joint_img = keypoints_2d.astype(np.float32)
-            joints_3d_np = keypoints_3d[:, :3].astype(np.float32)
-            joints_3d_gt = torch.from_numpy(joints_3d_np).float()
-            mano_pose = np.concatenate(
-                [aug_mano_params['global_orient'], aug_mano_params['hand_pose']],
-                axis=0
-            ).astype(np.float32)
-            mano_shape = aug_mano_params['betas'].astype(np.float32)
-            trans_3x3 = np.eye(3, dtype=np.float32)
-            trans_3x3[:2, :] = trans
-            K = np.array(
-                [[cam_para[0], 0.0, cam_para[2]], [0.0, cam_para[1], cam_para[3]], [0.0, 0.0, 1.0]],
-                dtype=np.float32,
-            )
-            K_patch = trans_3x3 @ K
-            cam_para = (K_patch[0, 0], K_patch[1, 1], K_patch[0, 2], K_patch[1, 2])
-            data_depth = torch.zeros((1, self.img_size, self.img_size), dtype=torch.float32)
-            return {
-                'rgb': imgRGB,
-                'depth': data_depth,
-                'n_i': 0,
-                'has_depth': False,
-                'joint_img': torch.from_numpy(joint_img).float(),
-                'joint_3d': torch.from_numpy((joints_3d_np - joints_3d_np.mean(0)) / (self.cube_size[2] / 2.0)).float(),
-                'joints_3d_gt': joints_3d_gt,
-                'mano_pose': torch.from_numpy(mano_pose).float(),
-                'mano_shape': torch.from_numpy(mano_shape).float(),
-                'mano_trans': torch.from_numpy(mano_trans).float(),
-                'cam_param': torch.from_numpy(np.array(cam_para)).float(),
-                'center': torch.from_numpy(center_xyz).float(),
-                'M': torch.eye(3).float(),
-                'cube': torch.from_numpy(np.array(self.cube_size)).float(),
-                'hand_type': hand_type,
-                'is_right': 1.0 if hand_type == 'right' else 0.0
-            }
+        
+        bbox_size = float(scale.max())
+        
 
-        # Crop depth
-        if has_depth:
-            depth_crop, trans = self.Crop_Image_deep_pp(depth, center_uvd, self.cube_size, 
-                                                        (self.img_size, self.img_size), cam_para)
-        else:
-            depth_crop = np.zeros((self.img_size, self.img_size), dtype=np.float32)
-            trans = np.eye(3)
+        mano_params = {
+            'global_orient': mano_pose[:3].copy(),
+            'hand_pose': mano_pose[3:].copy(),
+            'betas': mano_shape.copy()
+        }
+        has_mano_params = {
+            'global_orient': np.array([1.0], dtype=np.float32),
+            'hand_pose': np.array([1.0], dtype=np.float32),
+            'betas': np.array([1.0], dtype=np.float32)
+        }
+        flip_perm = list(range(21))
+        img_patch, keypoints_2d, keypoints_3d, aug_mano_params, _, _, trans = get_example(
+            rgb, center[0], center[1], scale[0], scale[1],
+            keypoints_2d, keypoints_3d, mano_params, has_mano_params,
+            flip_perm, self.patch_width, self.patch_height,
+            None, None,
+            do_augment=self.train, is_right=(hand_type == 'right'),
+            augm_config=self.wilor_aug_config, is_bgr=True,
+            return_trans=True
+        )
+        # Convert to float [0, 1]
+        imgRGB_01 = torch.from_numpy(img_patch).float() / 255.0
 
-        # Crop RGB
-        if rgb is not None:
-            rgb_crop, trans_rgb = self.Crop_Image_deep_pp_RGB(copy.deepcopy(rgb), center_uvd, self.cube_size,
-                                                              (self.img_size, self.img_size), cam_para)
-        else:
-            rgb_crop = np.zeros((self.img_size, self.img_size, 3), dtype=np.float32)
-            trans_rgb = np.eye(3)
+        # NEW AUGMENTATION 2 & 3: Brightness and Contrast adjustment (align with FreiHANDDatasetV2)
+        if self.train:
+            # Apply brightness adjustment
+            if np.random.rand() < self.brightness_prob:
+                brightness_delta = np.random.uniform(self.brightness_limit[0], self.brightness_limit[1])
+                imgRGB_01 = torch.clamp(imgRGB_01 + brightness_delta, 0.0, 1.0)
 
-        # Augmentation
-        if self.split == 'train' and self.train:
-            mode, off, rot, sc = self.rand_augment()
-            if has_depth:
-                imgD, _, curLabel, cube, com2D, M, _ = self.augmentCrop(
-                    depth_crop, gt3Dcrop, center_uvd, self.cube_size, trans, mode, off, rot, sc, cam_para)
-            else:
-                imgD = np.zeros((self.img_size, self.img_size), dtype=np.float32)
-                curLabel = gt3Dcrop / (self.cube_size[2] / 2.0)
-                cube = np.array(self.cube_size)
-                com2D = center_uvd
-                M = trans
+            # Apply contrast adjustment
+            if np.random.rand() < self.contrast_prob:
+                contrast_factor = np.random.uniform(self.contrast_limit[0], self.contrast_limit[1])
+                mean_val = imgRGB_01.mean(dim=[1, 2], keepdim=True)
+                imgRGB_01 = torch.clamp((imgRGB_01 - mean_val) * contrast_factor + mean_val, 0.0, 1.0)
 
-            if rgb is not None:
-                imgRGB, _, curLabel_rgb, cube_rgb, com2D_rgb, M_rgb, _ = self.augmentCrop_RGB(
-                    rgb_crop, gt3Dcrop, center_uvd, self.cube_size, trans_rgb, mode, off, rot, sc, cam_para)
-                
-                # Apply color augmentation (KeypointFusion-inspired)
-                if random.random() < self.color_aug_prob and self.color_factor > 0:
-                    # Per-channel independent color jitter (±20%)
-                    c_up = 1.0 + self.color_factor
-                    c_low = 1.0 - self.color_factor
-                    color_scale = np.array([
-                        random.uniform(c_low, c_up),  # R channel
-                        random.uniform(c_low, c_up),  # G channel
-                        random.uniform(c_low, c_up)   # B channel
-                    ])
-                    imgRGB = np.clip(imgRGB * color_scale[None, None, :], 0, 255)
-                
-                # Output RGB in [0,1] for GPGFormer (model handles WiLoR normalization internally).
-                imgRGB = torch.from_numpy(imgRGB[:, :, ::-1].copy()).permute(2, 0, 1).float() / 255.0
-            else:
-                imgRGB = torch.zeros((3, self.img_size, self.img_size))
+        # Apply ImageNet normalization
+        imgRGB = (imgRGB_01 - self.imagenet_mean) / self.imagenet_std
 
-            curLabel = curLabel / (cube[2] / 2.0)
-        else:
-            if has_depth:
-                imgD = self.normalize_img(depth_crop.max(), depth_crop, center_xyz, self.cube_size)
-            else:
-                imgD = np.zeros((self.img_size, self.img_size), dtype=np.float32)
-            if rgb is not None:
-                imgRGB = torch.from_numpy(rgb_crop[:, :, ::-1].copy()).permute(2, 0, 1).float() / 255.0
-            else:
-                imgRGB = torch.zeros((3, self.img_size, self.img_size))
-            curLabel = gt3Dcrop / (self.cube_size[2] / 2.0)
-            cube = np.array(self.cube_size)
-            com2D = center_uvd
-            M = trans
-
-        com3D = self.jointImgTo3D(com2D, cam_para)
-        joint_img = transformPoints2D(self.joint3DToImg(curLabel * (cube[0] / 2.0) + com3D, cam_para), M)
-        # WiLoR normalization: keypoints_2d = keypoints_2d / patch_width - 0.5
-        # This normalizes to [-0.5, 0.5] range instead of [-1, 1]
-        joint_img[:, 0:2] = joint_img[:, 0:2] / self.img_size - 0.5
-        joint_img[:, 2] = (joint_img[:, 2] - com3D[2]) / (cube[0] / 2.0)
-
-        # Convert to tensors
-        data_depth = torch.from_numpy(imgD).float().unsqueeze(0)  # (1, H, W)
-        data_rgb = imgRGB  # (3, H, W)
-        joint_img = torch.from_numpy(joint_img).float()  # (21, 3)
-        joint = torch.from_numpy(curLabel).float()  # (21, 3)
-        center = torch.from_numpy(com3D).float()  # (3,)
-        M_tensor = torch.from_numpy(M).float()  # (3, 3)
-        cube_tensor = torch.from_numpy(cube).float()  # (3,)
-        cam_para_tensor = torch.from_numpy(np.array(cam_para)).float()  # (4,)
-
-        # MANO parameters
-        mano_pose_tensor = torch.from_numpy(mano_pose).float()  # (48,)
-        mano_shape_tensor = torch.from_numpy(mano_shape).float()  # (10,)
-        mano_trans_tensor = torch.from_numpy(mano_trans).float()  # (3,)
-
-        # Ground truth joints and vertices (will be computed from MANO if needed)
-        joints_3d_gt = torch.from_numpy(joint_xyz).float()  # (21, 3)
-
+        joints_3d_np = keypoints_3d[:, :3].astype(np.float32)
+        mano_pose = np.concatenate(
+            [aug_mano_params['global_orient'], aug_mano_params['hand_pose']],
+            axis=0
+        ).astype(np.float32)
+        mano_shape = aug_mano_params['betas'].astype(np.float32)
+        trans_3x3 = np.eye(3, dtype=np.float32)
+        trans_3x3[:2, :] = trans
+        K = np.array(
+            [[cam_para[0], 0.0, cam_para[2]], [0.0, cam_para[1], cam_para[3]], [0.0, 0.0, 1.0]],
+            dtype=np.float32,
+        )
+        K_patch = trans_3x3 @ K
+        cam_para = (K_patch[0, 0], K_patch[1, 1], K_patch[0, 2], K_patch[1, 2])
+        scale_norm = scale / 200.0
+        # bbox_size already calculated earlier for center jitter
+        bbox_expand_factor = float(bbox_size / max((scale_norm * 200.0).max(), 1e-6))
+        uv_xy = keypoints_2d[:, :2]
+        uv_valid = ((uv_xy > -0.5) & (uv_xy < 0.5)).astype(np.float32)
+        uv_valid = (uv_valid[:, 0] * uv_valid[:, 1]).astype(np.float32)
+        xyz_valid = 1.0
+        if uv_valid[self.root_index] == 0 and uv_valid[0] == 0:
+            xyz_valid = 0.0
+        mano_params_is_axis_angle = {
+            'global_orient': True,
+            'hand_pose': True,
+            'betas': False
+        }
         return {
-            'rgb': data_rgb,  # (3, H, W)
-            'depth': data_depth,  # (1, H, W)
-            'n_i': n_i,  # modality flag: 0 or 1
-            'has_depth': has_depth,  # whether depth exists
-            'joint_img': joint_img,  # (21, 3) normalized joint image coordinates
-            'joint_3d': joint,  # (21, 3) normalized joint 3D coordinates
-            'joints_3d_gt': joints_3d_gt,  # (21, 3) absolute joint 3D coordinates
-            'mano_pose': mano_pose_tensor,  # (48,)
-            'mano_shape': mano_shape_tensor,  # (10,)
-            'mano_trans': mano_trans_tensor,  # (3,)
-            'cam_param': cam_para_tensor,  # (4,)
-            'center': center,  # (3,)
-            'M': M_tensor,  # (3, 3)
-            'cube': cube_tensor,  # (3,)
-            'hand_type': hand_type,  # 'left' or 'right'
+            'rgb': imgRGB,
+            'keypoints_2d': torch.from_numpy(keypoints_2d.astype(np.float32)).float(),
+            'keypoints_3d': torch.from_numpy((joints_3d_np - joints_3d_np.mean(0)) / (self.cube_size[2] / 2.0)).float(),
+            # 'joints_3d_gt': torch.from_numpy(joints_3d_np).float(),
+            'mano_params': aug_mano_params,
+            'cam_param': torch.from_numpy(np.array(cam_para)).float(),
+            'box_center': torch.from_numpy(center.astype(np.float32)),
+            'box_size': torch.tensor(bbox_size, dtype=torch.float32),
+            'bbox_expand_factor': torch.tensor(bbox_expand_factor, dtype=torch.float32),
+            '_scale': torch.from_numpy(scale_norm.astype(np.float32)),
+            'mano_params_is_axis_angle': mano_params_is_axis_angle,
+            'uv_valid': torch.from_numpy(uv_valid.astype(np.float32)),
+            'xyz_valid': torch.tensor(xyz_valid, dtype=torch.float32),
+            'hand_type': hand_type,
             'is_right': 1.0 if hand_type == 'right' else 0.0
         }
+
+       
+
+
+# DexYCB to MANO joint mapping (moved from commented section at top)
+DexYCB2MANO = [
+    0,
+    5, 6, 7,
+    9, 10, 11,
+    17, 18, 19,
+    13, 14, 15,
+    1, 2, 3,
+    8, 12, 20, 16, 4
+]
+
+
+def main():
+    """Debug/inspect DexYCBDataset by printing a few samples."""
+    import argparse
+    from pprint import pformat
+
+    def _describe_value(x, max_list_items: int = 8, max_str_len: int = 200) -> str:
+        if isinstance(x, torch.Tensor):
+            x_det = x.detach()
+            desc = f"torch.Tensor(shape={tuple(x_det.shape)}, dtype={x_det.dtype}, device={x_det.device})"
+            if x_det.numel() > 0 and x_det.is_floating_point():
+                desc += f", min={x_det.min().item():.4g}, max={x_det.max().item():.4g}"
+            return desc
+        if isinstance(x, np.ndarray):
+            desc = f"np.ndarray(shape={x.shape}, dtype={x.dtype})"
+            if x.size > 0 and np.issubdtype(x.dtype, np.floating):
+                desc += f", min={np.nanmin(x):.4g}, max={np.nanmax(x):.4g}"
+            return desc
+        if isinstance(x, (int, float, bool, np.number)):
+            return f"{type(x).__name__}({x})"
+        if isinstance(x, str):
+            s = x if len(x) <= max_str_len else x[:max_str_len] + "..."
+            return f"str(len={len(x)}): {s!r}"
+        if isinstance(x, (list, tuple)):
+            head = list(x[:max_list_items])
+            more = "" if len(x) <= max_list_items else f", ... (+{len(x)-max_list_items} more)"
+            return f"{type(x).__name__}(len={len(x)}): {head!r}{more}"
+        if isinstance(x, dict):
+            return f"dict(keys={list(x.keys())})"
+        return f"{type(x).__name__}"
+
+    parser = argparse.ArgumentParser(description="Print/inspect DexYCBDataset contents.")
+    parser.add_argument("--root-dir", type=str, required=True, help="Path to DexYCB root directory.")
+    parser.add_argument("--setup", type=str, default="s0", help="Dataset setup (e.g., s0, s1, s2, s3).")
+    parser.add_argument("--split", type=str, default="train", choices=["train", "test", "val"], help="Dataset split.")
+    parser.add_argument("--img-size", type=int, default=256, help="Output image size.")
+    parser.add_argument("--center-jitter", type=float, default=0.05, help="Center jitter factor.")
+    parser.add_argument("--num-samples", type=int, default=3, help="How many samples to print.")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed.")
+    args = parser.parse_args()
+
+    # Default augmentation config (same as config_dexycb.yaml)
+    default_wilor_aug_config = {
+        'SCALE_FACTOR': 0.3,
+        'ROT_FACTOR': 30,
+        'TRANS_FACTOR': 0.02,
+        'COLOR_SCALE': 0.2,
+        'ROT_AUG_RATE': 0.6,
+        'TRANS_AUG_RATE': 0.5,
+        'DO_FLIP': False,
+        'FLIP_AUG_RATE': 0.0,
+        'EXTREME_CROP_AUG_RATE': 0.0,
+        'EXTREME_CROP_AUG_LEVEL': 1,
+    }
+
+    ds = DexYCBDataset(
+        setup=args.setup,
+        split=args.split,
+        root_dir=args.root_dir,
+        img_size=args.img_size,
+        train=(args.split == 'train'),
+        align_wilor_aug=True,
+        wilor_aug_config=default_wilor_aug_config,
+        center_jitter_factor=args.center_jitter,
+    )
+
+    print("\n=== DexYCBDataset summary ===")
+    print(f"setup={ds.setup}, split={ds.split}, len={len(ds)}")
+    print(f"dex_ycb_root={ds.dex_ycb_root}")
+    print(f"center_jitter_factor={ds.center_jitter_factor}")
+    print("=======================\n")
+
+    random.seed(args.seed)
+    n = min(args.num_samples, len(ds))
+    indices = random.sample(range(len(ds)), k=n) if n > 0 else []
+
+    for i, idx in enumerate(indices):
+        print(f"\n--- Sample {i+1}/{len(indices)} | idx={idx} ---")
+        sample = ds[idx]
+        for k in sorted(sample.keys()):
+            v = sample[k]
+            print(f"{k}: {_describe_value(v)}")
+
+
+if __name__ == "__main__":
+    main()
+

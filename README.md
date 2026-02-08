@@ -53,7 +53,57 @@ GPGFormer supports multi-GPU distributed training via **PyTorch DDP** (same `tor
 ### Train with N GPUs
 
 ```bash
-torchrun --nproc_per_node=4 --master_port=29500 train.py --config configs/config_ho3d.yaml
+torchrun --nproc_per_node=4 --master_port=29500 train.py --config configs/config_freihand.yaml
+```
+
+后台运行指令
+```bash
+nohup torchrun --nproc_per_node=4 --master_port=29500 train.py --config configs/config_freihand.yaml > /root/code/vepfs/GPGFormer/logs/training.log 2>&1 &
+```
+
+验证数据加载器：
+验证Dex-YCB数据集：
+```bash
+python -m data.dex_ycb_dataset --root-dir /root/code/vepfs/dataset/dex-ycb --setup s0 --split train --num-samples 3
+```
+验证HO3D_v3数据集：
+```bash
+python -m data.ho3d_dataset --root-dir /path/to/HO3D_v3 --split train --num-samples 3
+```
+
+### 检查数据集标签
+
+使用数据集标签检查脚本来查看数据集的结构和标注信息：
+
+检查两个数据集（默认）：
+```bash
+python scripts/inspect_dataset_labels.py
+```
+
+只检查 DexYCB 数据集：
+```bash
+python scripts/inspect_dataset_labels.py --dataset dexycb
+```
+
+只检查 HO3D 数据集：
+```bash
+python scripts/inspect_dataset_labels.py --dataset ho3d
+```
+
+自定义参数示例：
+```bash
+# 检查 DexYCB 的 s1 设置，test 划分，显示 5 个样本
+python scripts/inspect_dataset_labels.py \
+    --dataset dexycb \
+    --dexycb-setup s1 \
+    --dexycb-split test \
+    --num-samples 5
+
+# 检查 HO3D 的 evaluation 划分
+python scripts/inspect_dataset_labels.py \
+    --dataset ho3d \
+    --ho3d-split evaluation \
+    --num-samples 5
 ```
 
 Notes:
