@@ -1,0 +1,136 @@
+dataset:
+  name: freihand
+  img_size: 256
+  root_index: 9
+  use_trainval_split: false
+  trainval_ratio: 0.9
+  trainval_seed: 42
+  align_wilor_aug: true
+  bbox_source_eval: detector
+  wilor_aug_config:
+    SCALE_FACTOR: 0.3
+    ROT_FACTOR: 30
+    TRANS_FACTOR: 0.02
+    COLOR_SCALE: 0.2
+    ROT_AUG_RATE: 0.6
+    TRANS_AUG_RATE: 0.5
+    DO_FLIP: false
+    FLIP_AUG_RATE: 0.0
+    EXTREME_CROP_AUG_RATE: 0.0
+    EXTREME_CROP_AUG_LEVEL: 1
+
+  # Mixed training datasets (used by train_mixed.py)
+  mixed_datasets:
+    - name: freihand
+      weight: 1.0
+    - name: ho3d
+      weight: 0.5
+      ho3d_version: v3
+      ho3d_val_split: val
+      ho3d_trainval_ratio: 0.9
+      ho3d_trainval_seed: 42
+      ho3d_trainval_split_by: sequence
+    - name: dexycb
+      weight: 0.3
+      dexycb_setup: s0
+
+paths:
+  freihand_root: /root/code/vepfs/dataset/FreiHAND_pub_v2
+  freihand_eval_root: /root/code/vepfs/dataset/FreiHAND_pub_v2_eval
+  ho3d_root: /root/code/vepfs/dataset/HO3D_v3
+  dexycb_root: /root/code/vepfs/dataset/dex-ycb
+  wilor_ckpt: /root/code/vepfs/GPGFormer/weights/wilor_final.ckpt
+  detector_ckpt: /root/code/vepfs/GPGFormer/weights/detector.pt
+  moge2_ckpt: /root/code/vepfs/GPGFormer/weights/model.pt
+  mano_dir: /root/code/vepfs/GPGFormer/weights/mano
+  mano_mean_params: /root/code/vepfs/GPGFormer/weights/mano/mano_mean_params.npz
+
+model:
+  image_size: 256
+  focal_length: 5000
+  use_geo_prior: true
+  moge2_num_tokens: 400
+  moge2_output: neck
+  token_fusion_mode: sum
+  sum_fusion_strategy: channel_concat
+  cross_attn_num_heads: 8
+  cross_attn_dropout: 0.0
+  cross_attn_gate_init: 0.0
+  geo_tokenizer_use_pooling: true
+  mano_decoder: wilor
+  freihand_mano_root: /root/code/hand_reconstruction/freihand/data
+  mano_head:
+    ief_iters: 3
+    transformer_input: mean_shape
+    dim: 1024
+    depth: 6
+    heads: 8
+    dim_head: 64
+    mlp_dim: 2048
+    dropout: 0.0
+  feature_refiner:
+    method: sjta
+    feat_dim: 1280
+    sjta_bottleneck_dim: 256
+    sjta_num_heads: 4
+    sjta_use_2d_prior: true
+    sjta_num_steps: 3
+    coear_dilation1: 1
+    coear_dilation2: 2
+    coear_gate_reduction: 8
+    coear_init_alpha: 0.1
+    kcr_num_keypoints: 21
+    kcr_hidden_dim: 128
+
+loss:
+  reduction: mean
+  w_2d: 1.0
+  w_kcr_2d: 1.0
+  w_3d_joint: 5.0
+  w_bone_length: 2.0
+  joint_3d_tip_weight: 2.0
+  tip_joint_indices: [4, 8, 12, 16, 20]
+  bone_pairs:
+    - [0, 1]
+    - [1, 2]
+    - [2, 3]
+    - [3, 4]
+    - [0, 5]
+    - [5, 6]
+    - [6, 7]
+    - [7, 8]
+    - [0, 9]
+    - [9, 10]
+    - [10, 11]
+    - [11, 12]
+    - [0, 13]
+    - [13, 14]
+    - [14, 15]
+    - [15, 16]
+    - [0, 17]
+    - [17, 18]
+    - [18, 19]
+    - [19, 20]
+  w_3d_vert: 0.0
+  w_global_orient: 1.0
+  w_hand_pose: 1.0
+  w_scale: 0.0
+
+train:
+  use_cuda: true
+  epochs: 50
+  batch_size: 96
+  val_batch_size: 96
+  lr: 2e-5
+  weight_decay: 1e-4
+  # lr_multiplier:
+  #   backbone: 0.5
+  #   head: 5.0
+  warmup_epochs: 5
+  min_lr: 0.0
+  grad_clip_norm: 1.0
+  use_ema: false
+  ema_decay: 0.9999
+  eval_train_metrics: false
+  num_workers: 16
+  out_dir: /root/code/vepfs/GPGFormer/checkpoints/mixed_freihand

@@ -10,8 +10,18 @@ dataset:
   ho3d_trainval_ratio: 0.9
   ho3d_trainval_seed: 42
   ho3d_trainval_split_by: sequence  # sequence | frame
+  # Use JSON split files instead of train.txt/evaluation.txt + per-frame meta pkl.
+  ho3d_use_json_split: true
+  # JSON keypoints_3d unit handling for HO3DJsonDataset: auto | m | mm
+  ho3d_json_kp3d_unit: auto
+  # Extra multiplier after unit conversion.
+  ho3d_json_kp3d_scale: 1.0
+  # Optional coordinate conversion (x,y,z)->(x,-y,-z).
+  ho3d_json_convert_xyz: false
   align_wilor_aug: true
-  bbox_source_eval: detector
+  # HO3D has labels for cropping (train/val: joints+K, evaluation/test: handBoundingBox).
+  # Keep this label-based and do not use a detector model.
+  bbox_source_eval: gt
   wilor_aug_config:
     SCALE_FACTOR: 0.3
     ROT_FACTOR: 30
@@ -25,22 +35,43 @@ dataset:
     EXTREME_CROP_AUG_LEVEL: 1
 
 paths:
-  ho3d_root: /data1/users/Robert/datasets/HO3D_v3
-  wilor_ckpt: /data0/users/Robert/linweiquan/GPGFormer/weights/wilor/wilor_final.ckpt
-  detector_ckpt: /data0/users/Robert/linweiquan/GPGFormer/weights/wilor/detector.pt
-  moge2_ckpt: /data0/users/Robert/linweiquan/GPGFormer/weights/moge2/model.pt
-  mano_dir: /data0/users/Robert/linweiquan/GPGFormer/weights/mano
-  mano_mean_params: /data0/users/Robert/linweiquan/GPGFormer/weights/mano/mano_mean_params.npz
+  ho3d_root: /root/code/vepfs/dataset/HO3D_v3
+  # Optional HO3D JSON split files for HO3DJsonDataset.
+  ho3d_train_json: /c20250503/lwq/dataset/handos_data/HO3Dv3/HO3D-train-normalized.json
+  ho3d_test_json: /c20250503/lwq/dataset/handos_data/HO3Dv3/HO3D-evaluation-meter.json
+  wilor_ckpt: /root/code/vepfs/GPGFormer/weights/wilor_final.ckpt
+  detector_ckpt: /root/code/vepfs/GPGFormer/weights/detector.pt
+  moge2_ckpt: /root/code/vepfs/GPGFormer/weights/model.pt
+  mano_dir: /root/code/vepfs/GPGFormer/weights/mano
+  mano_mean_params: /root/code/vepfs/GPGFormer/weights/mano/mano_mean_params.npz
 
 model:
   image_size: 256
   focal_length: 5000
-  # Token fusion mode: concat (concatenate tokens) or sum (element-wise sum)
-  token_fusion_mode: sum # concat | sum
+  # Ablation: disable geometry prior branch (MoGe2) and use RGB only.
+  use_geo_prior: true
+  # MoGe2 inference token budget (controls MoGe2 internal resolution / compute).
+  # Suggested sweep: 400 (fast) / 800 / 1200 / 1800.
+  moge2_num_tokens: 400
+  # Token fusion mode: concat (concatenate tokens) or sum (element-wise sum) or cross_attn (cross-attention)
+  token_fusion_mode: sum # concat | sum | cross_attn
   # Sum fusion strategy (only used when token_fusion_mode=sum)
   # Options: basic | weighted | normalized | weighted_normalized | channel_concat
   # - channel_concat: Token-wise channel concatenation + projection (preserves info, learns alignment)
-  sum_fusion_strategy: basic
+  sum_fusion_strategy: channel_concat
+  # Cross-attention settings (only used when token_fusion_mode=cross_attn)
+  cross_attn_num_heads: 8
+  cross_attn_dropout: 0.0
+  # Gated residual scale for cross-attn branch. 0.0 means no geo injection at init.
+  cross_attn_gate_init: 0.0
+  side_tuning:
+    enabled: false
+    side_channels: 256
+    dropout: 0.1
+  # GeoTokenizer pooling: set to false to keep full resolution (recommended for cross_attn)
+  geo_tokenizer_use_pooling: true
+  mano_decoder: wilor # wilor | freihand_legacy
+  freihand_mano_root: /root/code/hand_reconstruction/freihand/data
   mano_head:
     # HaMeR-style MANO head (cross-attn TransformerDecoder + IEF)
     ief_iters: 3
@@ -53,48 +84,77 @@ model:
     dropout: 0.0
   # Feature Refiner: Lightweight feature refinement module
   feature_refiner:
-    method: none  # Options: sjta, coear, kcr, none
+    method: sjta  # Options: sjta, coear, wilor_msf, kcr, none
     feat_dim: 1280
     sjta_bottleneck_dim: 256
     sjta_num_heads: 4
     sjta_use_2d_prior: true
+    sjta_num_steps: 3
     coear_dilation1: 1
     coear_dilation2: 2
     coear_gate_reduction: 8
     coear_init_alpha: 0.1
+    wilor_msf_bottleneck_ratio: 4
+    wilor_msf_dilation1: 1
+    wilor_msf_dilation2: 2
+    wilor_msf_dilation3: 3
+    wilor_msf_gate_reduction: 8
+    wilor_msf_init_alpha: 0.1
     kcr_num_keypoints: 21
     kcr_hidden_dim: 128
 
 loss:
   reduction: mean
-  w_2d: 5.0
-  w_3d_joint: 1.0
-  w_3d_vert: 0.5
-  w_global_orient: 10.0
-  w_hand_pose: 10.0
+  w_2d: 1.0
+  # Extra lightweight supervision for KCR heatmap/soft-argmax branch (only used when KCR is enabled)
+  w_kcr_2d: 1.0
+  w_3d_joint: 5.0
+  w_bone_length: 2.0
+  joint_3d_tip_weight: 2.0
+  tip_joint_indices: [4, 8, 12, 16, 20]
+  # Canonical 21-joint hand kinematic tree (wrist -> each finger chain).
+  bone_pairs:
+    - [0, 1]
+    - [1, 2]
+    - [2, 3]
+    - [3, 4]
+    - [0, 5]
+    - [5, 6]
+    - [6, 7]
+    - [7, 8]
+    - [0, 9]
+    - [9, 10]
+    - [10, 11]
+    - [11, 12]
+    - [0, 13]
+    - [13, 14]
+    - [14, 15]
+    - [15, 16]
+    - [0, 17]
+    - [17, 18]
+    - [18, 19]
+    - [19, 20]
+  w_global_orient: 1.0
+  w_hand_pose: 1.0
+  w_scale: 0.0
   # Stabilizers for HO3D:
   # - w_mano_trans directly supervises predicted camera translation (meters) using GT mano_trans.
   # - w_scale reduces MPJPE >> PA-MPJPE scale drift (dimensionless, log-ratio).
-  w_mano_trans: 1.0
-  w_scale: 0.1
 
 train:
   use_cuda: true
   epochs: 50
-  batch_size: 16
-  val_batch_size: 16
-  lr: 5.0e-5
+  batch_size: 96
+  val_batch_size: 96
+  lr: 4e-5
   weight_decay: 1.0e-4
   warmup_epochs: 5
   min_lr: 0.0
   # Extra numeric safety
   grad_clip_norm: 1.0
   # Exponential Moving Average (EMA) for model parameters
-  use_ema: true
+  use_ema: false
   ema_decay: 0.9999
-  num_workers: 4
-  out_dir: checkpoints
-
-
-
-
+  eval_train_metrics: false #打印训练集的指标
+  num_workers: 32
+  out_dir: /root/code/vepfs/GPGFormer/checkpoints/ho3d_20260302_lr_4e-5

@@ -10,14 +10,13 @@ class GeoTokenizer(nn.Module):
     Tokenizer2: target feature map (B,C,H,W) -> tokens (B, N, D=1280)
     """
 
-    def __init__(self, in_channels: int, embed_dim: int = 1280, out_hw: tuple[int, int] = (16, 12)):
+    def __init__(self, in_channels: int, embed_dim: int = 1280, out_hw: tuple[int, int] = (16, 12), use_pooling: bool = True):
         super().__init__()
         self.embed_dim = embed_dim
         self.out_hw = out_hw
+        self.use_pooling = use_pooling
         self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=1, stride=1, padding=0)
         nn.init.zeros_(self.proj.bias)
-
-        # Type embedding is applied in the encoder; keep tokenizer purely geometric.
 
     def forward(self, feat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -25,25 +24,28 @@ class GeoTokenizer(nn.Module):
             feat: (B,C,H,W)
         Returns:
             tokens: (B, N, D)
-            coords: (H,W,2) normalized in [-1,1] for positional embedding (optional)
+            coords: (H,W,2) normalized in [-1,1] for positional embedding
         """
-        b, _, _, _ = feat.shape
+        b, _, h, w = feat.shape
 
-        # IMPORTANT: pool FIRST to avoid massive intermediate activations.
-        # MoGe2 neck outputs can be high-res; projecting to 1280 channels before pooling can OOM.
-        oh, ow = self.out_hw
-        feat_small = F.adaptive_avg_pool2d(feat, output_size=(oh, ow))  # (B,C,oh,ow)
-        x = self.proj(feat_small)  # (B,D,oh,ow)
+        if self.use_pooling:
+            oh, ow = self.out_hw
+            feat_small = F.adaptive_avg_pool2d(feat, output_size=(oh, ow))
+            x = self.proj(feat_small)
+        else:
+            # No pooling: keep original resolution
+            x = self.proj(feat)
+            oh, ow = h, w
 
         tokens = x.flatten(2).transpose(1, 2).contiguous()  # (B, oh*ow, D)
 
-        # Normalized grid for optional positional encoding
+        # Normalized grid for positional encoding
         yy, xx = torch.meshgrid(
             torch.linspace(-1.0, 1.0, oh, device=feat.device, dtype=feat.dtype),
             torch.linspace(-1.0, 1.0, ow, device=feat.device, dtype=feat.dtype),
             indexing="ij",
         )
-        coords = torch.stack([xx, yy], dim=-1)  # (H,W,2)
+        coords = torch.stack([xx, yy], dim=-1)
         return tokens, coords
 
 
@@ -63,6 +65,7 @@ class CoordPosEmbed(nn.Module):
         # Start near-zero so it doesn't disturb pretrained weights initially.
         for m in self.mlp.modules():
             if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, mean=0.0, std=1e-4)
                 nn.init.zeros_(m.bias)
 
     def forward(self, coords_hw2: torch.Tensor) -> torch.Tensor:
@@ -75,5 +78,4 @@ class CoordPosEmbed(nn.Module):
         h, w, _ = coords_hw2.shape
         pos = self.mlp(coords_hw2.reshape(h * w, 2))
         return pos
-
 

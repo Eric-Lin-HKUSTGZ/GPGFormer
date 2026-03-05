@@ -14,6 +14,7 @@ from third_party.moge_min.moge.model.v2 import MoGeModel
 class MoGe2Config:
     weights_path: str
     num_tokens: int = 1600
+    output: str = "neck"  # "neck" | "points"
 
 
 class MoGe2Prior(nn.Module):
@@ -44,10 +45,39 @@ class MoGe2Prior(nn.Module):
         Args:
             img_01: (B,3,H,W) in [0,1], RGB
         Returns:
-            target_features: (B,C,Hg,Wg) from MoGe2 conv neck last output ([-1])
+            target_features:
+              - output="neck": (B,C,Hg,Wg) from MoGe2 conv neck last output ([-1])
+              - output="points": (B,4,H,W) = cat([xyz*mask, mask]) from MoGe2 heads
         """
-        # We need the Conv neck output (not the heads).
-        # The vendored MoGe2 doesn't expose it directly, so we recompute the same neck-forward here.
+        out_mode = str(getattr(self.cfg, "output", "neck")).lower()
+        if out_mode not in ("neck", "points"):
+            raise ValueError(f"Unsupported MoGe2Config.output: {out_mode} (expected 'neck' or 'points')")
+
+        if out_mode == "points":
+            b, _, h, w = img_01.shape
+            device, dtype = img_01.device, img_01.dtype
+
+            out = self.model.forward(img_01, num_tokens=int(self.cfg.num_tokens))
+            points = out.get("points", None)
+            if points is None:
+                raise KeyError("MoGe2 forward() did not return 'points'; cannot build point-map tokens.")
+            # (B,H,W,3) -> (B,3,H,W)
+            points = torch.nan_to_num(points).to(device=device)
+            points_chw = points.permute(0, 3, 1, 2).contiguous()
+
+            mask = out.get("mask", None)
+            if mask is None:
+                mask = torch.ones((b, h, w), device=device, dtype=points_chw.dtype)
+            else:
+                mask = torch.nan_to_num(mask).to(device=device, dtype=points_chw.dtype)
+            mask_chw = mask.unsqueeze(1)  # (B,1,H,W)
+
+            feat = torch.cat([points_chw * mask_chw, mask_chw], dim=1)  # (B,4,H,W)
+            return feat.to(dtype=dtype)
+
+        # ---- neck mode (original behavior) ----
+        # We need the Conv neck output (not the heads). The vendored MoGe2 doesn't expose it directly,
+        # so we recompute the same neck-forward here.
         b, _, h, w = img_01.shape
         device, dtype = img_01.device, img_01.dtype
 
@@ -82,6 +112,5 @@ class MoGe2Prior(nn.Module):
         neck_out = self.model.neck(features)
         target = neck_out[-1]
         return target
-
 
 

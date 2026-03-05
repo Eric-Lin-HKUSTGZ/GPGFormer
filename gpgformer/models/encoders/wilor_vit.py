@@ -18,8 +18,14 @@ class WiLoRViTConfig:
     image_size: int = 256
     focal_length: float = 5000.0
     joint_rep: str = "aa"  # "6d" or "aa"
-    token_fusion_mode: str = "concat"  # "concat" | "sum"
+    token_fusion_mode: str = "concat"  # "concat" | "sum" | "cross_attn"
     sum_fusion_strategy: str = "basic"  # "basic" | "weighted" | "normalized" | "weighted_normalized" | "channel_concat"
+    # For sum+channel_concat, zero-init the last projection layer so x_fused starts from pure RGB features.
+    fusion_proj_zero_init: bool = True
+    # Cross-attention fusion settings
+    cross_attn_num_heads: int = 8
+    cross_attn_dropout: float = 0.0
+    cross_attn_gate_init: float = 0.0
 
 
 class WiLoRViTWithGeo(nn.Module):
@@ -83,6 +89,25 @@ class WiLoRViTWithGeo(nn.Module):
                     nn.GELU(),
                     nn.Linear(embed_dim, embed_dim)
                 )
+                if bool(getattr(cfg, "fusion_proj_zero_init", True)):
+                    last = self.fusion_proj[-1]
+                    if isinstance(last, nn.Linear):
+                        nn.init.zeros_(last.weight)
+                        if last.bias is not None:
+                            nn.init.zeros_(last.bias)
+                    print("[WiLoRViTWithGeo] channel_concat Proj last layer zero-init enabled")
+
+        # Cross-attention fusion: Query=RGB, Key/Value=Geo
+        if self.token_fusion_mode == "cross_attn":
+            embed_dim = self.backbone.embed_dim
+            num_heads = getattr(cfg, 'cross_attn_num_heads', 8)
+            dropout = getattr(cfg, 'cross_attn_dropout', 0.0)
+            gate_init = float(getattr(cfg, "cross_attn_gate_init", 0.0))
+            self.cross_attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
+            self.cross_attn_norm1 = nn.LayerNorm(embed_dim)
+            self.cross_attn_norm2 = nn.LayerNorm(embed_dim)
+            # Gate starts from 0 so cross-modal signal is injected gradually during training.
+            self.cross_attn_gate = nn.Parameter(torch.tensor(gate_init, dtype=torch.float32))
 
         # Load WiLoR pretrained backbone weights
         self._load_wilor_backbone(cfg.wilor_ckpt_path)
@@ -232,6 +257,30 @@ class WiLoRViTWithGeo(nn.Module):
             # All tokens are patch tokens in sum mode
             img_feat = x.reshape(B, Hp, Wp, -1).permute(0, 3, 1, 2).contiguous()
 
+        elif self.token_fusion_mode == "cross_attn":
+            # Cross-attention mode: Query=RGB, Key/Value=Geo
+            if geo_tokens is not None:
+                if geo_tokens.shape[-1] != self.backbone.embed_dim:
+                    raise ValueError(f"geo_tokens dim {geo_tokens.shape[-1]} != {self.backbone.embed_dim}")
+                # Add geo positional encoding
+                if geo_pos is not None:
+                    geo_tokens = geo_tokens + geo_pos.unsqueeze(0).to(dtype=geo_tokens.dtype, device=geo_tokens.device)
+                # Cross-attention: x attends to geo_tokens
+                x_normed = self.cross_attn_norm1(x)
+                geo_normed = self.cross_attn_norm2(geo_tokens)
+                attn_out, _ = self.cross_attn(query=x_normed, key=geo_normed, value=geo_normed)
+                gate = torch.tanh(self.cross_attn_gate).to(dtype=x.dtype, device=x.device)
+                x = x + gate * attn_out  # Gated residual connection
+
+            # Transformer blocks
+            for blk in self.backbone.blocks:
+                if self.backbone.use_checkpoint:
+                    x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
+                else:
+                    x = blk(x)
+            x = self.backbone.last_norm(x)
+            img_feat = x.reshape(B, Hp, Wp, -1).permute(0, 3, 1, 2).contiguous()
+
         else:
             # Concat mode (original behavior): [geo; img]
             toks = []
@@ -277,5 +326,3 @@ class WiLoRViTWithGeo(nn.Module):
         return {
             "img_feat": img_feat,
         }
-
-

@@ -31,6 +31,7 @@ class ModelEMA:
     ):
         self.decay = decay
         self.device = device
+        self._updates = 0
 
         # Create a shadow copy of the model
         self.ema_model = copy.deepcopy(model)
@@ -44,6 +45,11 @@ class ModelEMA:
         for param in self.ema_model.parameters():
             param.requires_grad = False
 
+        # Cache which state_dict keys are parameters vs buffers.
+        # Apply EMA to parameters and copy buffers directly (e.g., BatchNorm running stats).
+        self._param_keys = {k for k, _ in self.ema_model.named_parameters()}
+        self._buffer_keys = {k for k, _ in self.ema_model.named_buffers()}
+
     @torch.no_grad()
     def update(self, model: nn.Module):
         """
@@ -55,27 +61,28 @@ class ModelEMA:
         Args:
             model: Current model with updated parameters
         """
-        # Get state dicts
+        self._updates += 1
+
         model_state = model.state_dict()
         ema_state = self.ema_model.state_dict()
 
-        # Update EMA parameters
-        for key in model_state.keys():
-            if key in ema_state:
-                ema_param = ema_state[key]
-                model_param = model_state[key]
+        decay = float(self.decay)
+        one_minus = 1.0 - decay
 
-                # Only update floating point parameters
-                if ema_param.dtype in [torch.float16, torch.float32, torch.float64]:
-                    ema_state[key] = (
-                        self.decay * ema_param + (1.0 - self.decay) * model_param
-                    )
-                else:
-                    # For non-floating point parameters (e.g., buffers), just copy
-                    ema_state[key] = model_param.clone()
+        # Update EMA in-place to avoid per-step load_state_dict overhead.
+        for key, ema_v in ema_state.items():
+            model_v = model_state.get(key, None)
+            if model_v is None:
+                continue
 
-        # Load updated state dict
-        self.ema_model.load_state_dict(ema_state)
+            model_v = model_v.detach()
+            if model_v.device != ema_v.device:
+                model_v = model_v.to(device=ema_v.device)
+
+            if key in self._param_keys and torch.is_floating_point(ema_v):
+                ema_v.mul_(decay).add_(model_v, alpha=one_minus)
+            else:
+                ema_v.copy_(model_v)
 
     def state_dict(self):
         """Return EMA model's state dict."""

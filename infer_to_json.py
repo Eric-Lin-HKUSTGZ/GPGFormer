@@ -214,6 +214,74 @@ def build_dataset(cfg: dict):
     raise ValueError(f"Unknown dataset.name: {cfg['dataset']['name']}")
 
 
+def build_model_from_cfg(cfg: dict) -> GPGFormer:
+    model_cfg = cfg.get("model", {})
+    refiner_cfg = model_cfg.get("feature_refiner", {})
+    moge2_num_tokens = int(model_cfg.get("moge2_num_tokens", 400))
+    if moge2_num_tokens <= 0:
+        raise ValueError(f"model.moge2_num_tokens must be a positive int, got {moge2_num_tokens}")
+
+    return GPGFormer(
+        GPGFormerConfig(
+            wilor_ckpt_path=cfg["paths"]["wilor_ckpt"],
+            moge2_weights_path=cfg["paths"].get("moge2_ckpt", None),
+            use_geo_prior=bool(model_cfg.get("use_geo_prior", True)),
+            mano_model_path=cfg["paths"]["mano_dir"],
+            mano_mean_params=cfg["paths"]["mano_mean_params"],
+            mano_decoder=str(model_cfg.get("mano_decoder", "wilor")),
+            freihand_mano_root=model_cfg.get("freihand_mano_root", None),
+            focal_length=float(model_cfg.get("focal_length", 5000.0)),
+            mano_head_ief_iters=int(model_cfg.get("mano_head", {}).get("ief_iters", 3)),
+            mano_head_transformer_input=str(model_cfg.get("mano_head", {}).get("transformer_input", "mean_shape")),
+            mano_head_dim=int(model_cfg.get("mano_head", {}).get("dim", 1024)),
+            mano_head_depth=int(model_cfg.get("mano_head", {}).get("depth", 6)),
+            mano_head_heads=int(model_cfg.get("mano_head", {}).get("heads", 8)),
+            mano_head_dim_head=int(model_cfg.get("mano_head", {}).get("dim_head", 64)),
+            mano_head_mlp_dim=int(model_cfg.get("mano_head", {}).get("mlp_dim", 2048)),
+            mano_head_dropout=float(model_cfg.get("mano_head", {}).get("dropout", 0.0)),
+            moge2_num_tokens=moge2_num_tokens,
+            moge2_output=str(model_cfg.get("moge2_output", "neck")),
+            token_fusion_mode=str(model_cfg.get("token_fusion_mode", "concat")),
+            sum_fusion_strategy=str(model_cfg.get("sum_fusion_strategy", "basic")),
+            fusion_proj_zero_init=bool(model_cfg.get("fusion_proj_zero_init", True)),
+            cross_attn_num_heads=int(model_cfg.get("cross_attn_num_heads", 8)),
+            cross_attn_dropout=float(model_cfg.get("cross_attn_dropout", 0.0)),
+            cross_attn_gate_init=float(model_cfg.get("cross_attn_gate_init", 0.0)),
+            geo_tokenizer_use_pooling=bool(model_cfg.get("geo_tokenizer_use_pooling", True)),
+            feature_refiner_method=str(refiner_cfg.get("method", "none")),
+            feature_refiner_feat_dim=int(refiner_cfg.get("feat_dim", 1280)),
+            feature_refiner_sjta_bottleneck_dim=int(refiner_cfg.get("sjta_bottleneck_dim", 256)),
+            feature_refiner_sjta_num_heads=int(refiner_cfg.get("sjta_num_heads", 4)),
+            feature_refiner_sjta_use_2d_prior=bool(refiner_cfg.get("sjta_use_2d_prior", True)),
+            feature_refiner_sjta_num_steps=int(refiner_cfg.get("sjta_num_steps", 2)),
+            feature_refiner_coear_dilation1=int(refiner_cfg.get("coear_dilation1", 1)),
+            feature_refiner_coear_dilation2=int(refiner_cfg.get("coear_dilation2", 2)),
+            feature_refiner_coear_gate_reduction=int(refiner_cfg.get("coear_gate_reduction", 8)),
+            feature_refiner_coear_init_alpha=float(refiner_cfg.get("coear_init_alpha", 0.1)),
+            feature_refiner_wilor_msf_bottleneck_ratio=int(refiner_cfg.get("wilor_msf_bottleneck_ratio", 4)),
+            feature_refiner_wilor_msf_dilation1=int(refiner_cfg.get("wilor_msf_dilation1", 1)),
+            feature_refiner_wilor_msf_dilation2=int(refiner_cfg.get("wilor_msf_dilation2", 2)),
+            feature_refiner_wilor_msf_dilation3=int(refiner_cfg.get("wilor_msf_dilation3", 3)),
+            feature_refiner_wilor_msf_gate_reduction=int(refiner_cfg.get("wilor_msf_gate_reduction", 8)),
+            feature_refiner_wilor_msf_init_alpha=float(refiner_cfg.get("wilor_msf_init_alpha", 0.1)),
+            feature_refiner_kcr_num_keypoints=int(refiner_cfg.get("kcr_num_keypoints", 21)),
+            feature_refiner_kcr_hidden_dim=int(refiner_cfg.get("kcr_hidden_dim", 128)),
+        )
+    )
+
+
+def warmup_lazy_modules(model: GPGFormer, cfg: dict, device: torch.device) -> None:
+    model_cfg = cfg.get("model", {})
+    h = int(model_cfg.get("image_size", 256))
+    w = int(model_cfg.get("image_width", int(h * 0.75)))
+    # Avoid `torch.inference_mode()` here: lazily-created parameters become "inference tensors"
+    # and `load_state_dict()` (which does in-place copies) will error outside InferenceMode.
+    with torch.no_grad():
+        img_dummy = torch.zeros((1, 3, h, w), device=device, dtype=torch.float32)
+        cam_dummy = torch.tensor([[600.0, 600.0, w / 2.0, h / 2.0]], device=device, dtype=torch.float32)
+        _ = model(img_dummy, cam_param=cam_dummy)
+
+
 def infer_single_json(cfg, model, device):
     """Run inference on the test dataset and collect predictions."""
     dataset = build_dataset(cfg)
@@ -288,6 +356,13 @@ def main():
     # Load config
     cfg = yaml.safe_load(Path(args.config).read_text())
     print(f"Loaded config from {args.config}")
+    model_cfg = cfg.get("model", {})
+    moge2_num_tokens = int(model_cfg.get("moge2_num_tokens", 400))
+    if moge2_num_tokens <= 0:
+        raise ValueError(f"model.moge2_num_tokens must be a positive int, got {moge2_num_tokens}")
+    moge2_output = str(model_cfg.get("moge2_output", "neck"))
+    use_geo_prior = bool(model_cfg.get("use_geo_prior", True))
+    print(f"[info] use_geo_prior={use_geo_prior} moge2_output={moge2_output} moge2_num_tokens={moge2_num_tokens}")
 
     # Setup device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -295,35 +370,17 @@ def main():
 
     # Build model
     print("Building model...")
-    model = GPGFormer(
-        GPGFormerConfig(
-            wilor_ckpt_path=cfg["paths"]["wilor_ckpt"],
-            moge2_weights_path=cfg["paths"]["moge2_ckpt"],
-            mano_model_path=cfg["paths"]["mano_dir"],
-            mano_mean_params=cfg["paths"]["mano_mean_params"],
-            mano_decoder=str(cfg["model"].get("mano_decoder", "wilor")),
-            freihand_mano_root=cfg["model"].get("freihand_mano_root", None),
-            focal_length=float(cfg["model"].get("focal_length", 5000.0)),
-            mano_head_ief_iters=int(cfg["model"].get("mano_head", {}).get("ief_iters", 3)),
-            mano_head_transformer_input=str(cfg["model"].get("mano_head", {}).get("transformer_input", "mean_shape")),
-            mano_head_dim=int(cfg["model"].get("mano_head", {}).get("dim", 1024)),
-            mano_head_depth=int(cfg["model"].get("mano_head", {}).get("depth", 6)),
-            mano_head_heads=int(cfg["model"].get("mano_head", {}).get("heads", 8)),
-            mano_head_dim_head=int(cfg["model"].get("mano_head", {}).get("dim_head", 64)),
-            mano_head_mlp_dim=int(cfg["model"].get("mano_head", {}).get("mlp_dim", 2048)),
-            mano_head_dropout=float(cfg["model"].get("mano_head", {}).get("dropout", 0.0)),
-            moge2_num_tokens=int(cfg["model"].get("moge2_num_tokens", 400)),
-            token_fusion_mode=str(cfg["model"].get("token_fusion_mode", "concat")),
-            sum_fusion_strategy=str(cfg["model"].get("sum_fusion_strategy", "basic")),
-        )
-    ).to(device)
+    model = build_model_from_cfg(cfg).to(device)
+    # Ensure lazily created modules (e.g., geo_tokenizer) exist before loading checkpoint.
+    warmup_lazy_modules(model, cfg, device)
 
     # Load checkpoint
     print(f"Loading checkpoint from {args.ckpt}")
     ckpt = torch.load(args.ckpt, map_location="cpu")
     state = ckpt.get("model", ckpt)
-    model.load_state_dict(state, strict=False)
+    missing, unexpected = model.load_state_dict(state, strict=False)
     model.eval()
+    print(f"[ckpt] missing={len(missing)} unexpected={len(unexpected)}")
     print("Model loaded successfully")
 
     # Run inference
@@ -441,5 +498,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
