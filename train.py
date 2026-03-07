@@ -426,6 +426,8 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
             use_geo_side_tuning=bool(cfg["model"].get("side_tuning", {}).get("enabled", False)),
             geo_side_tuning_side_channels=int(cfg["model"].get("side_tuning", {}).get("side_channels", 256)),
             geo_side_tuning_dropout=float(cfg["model"].get("side_tuning", {}).get("dropout", 0.1)),
+            geo_side_tuning_max_res_scale=float(cfg["model"].get("side_tuning", {}).get("max_res_scale", 0.1)),
+            geo_side_tuning_init_res_scale=float(cfg["model"].get("side_tuning", {}).get("init_res_scale", 1e-3)),
             # Feature Refiner configuration
             feature_refiner_method=str(cfg["model"].get("feature_refiner", {}).get("method", "none")),
             feature_refiner_feat_dim=int(cfg["model"].get("feature_refiner", {}).get("feat_dim", 1280)),
@@ -639,10 +641,30 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
         progress = float(step + 1) / float(max(geo_ramp_steps, 1))
         return geo_start_factor + (1.0 - geo_start_factor) * progress
 
+    # Optional staged ramp for side_tuning group:
+    # side branch starts more conservatively than the main path and ramps up later.
+    side_start_factor = float(cfg["train"].get("side_tuning_start_factor", 1.0))
+    side_start_factor = min(max(side_start_factor, 0.0), 1.0)
+    side_ramp_steps = int(cfg["train"].get("side_tuning_ramp_steps", 0))
+    side_ramp_epochs = int(cfg["train"].get("side_tuning_ramp_epochs", 0))
+    if side_ramp_steps <= 0 and side_ramp_epochs > 0:
+        side_ramp_steps = max(side_ramp_epochs * steps_per_epoch, 0)
+    side_ramp_steps = min(max(side_ramp_steps, 0), total_steps)
+
+    def side_ramp_factor(step: int) -> float:
+        if side_ramp_steps <= 0 or side_start_factor >= 1.0:
+            return 1.0
+        if step >= side_ramp_steps:
+            return 1.0
+        progress = float(step + 1) / float(max(side_ramp_steps, 1))
+        return side_start_factor + (1.0 - side_start_factor) * progress
+
     lr_lambdas = []
     for name in param_group_names:
         if name == "geo_fusion":
             lr_lambdas.append(lambda step: lr_lambda(step) * geo_ramp_factor(step))
+        elif name == "side_tuning":
+            lr_lambdas.append(lambda step: lr_lambda(step) * side_ramp_factor(step))
         else:
             lr_lambdas.append(lr_lambda)
     scheduler = LambdaLR(optimizer, lr_lambda=lr_lambdas)
@@ -651,6 +673,12 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
         print(
             f"[sched] geo_fusion_start_factor={geo_start_factor:.3f}, "
             f"geo_fusion_ramp_steps={geo_ramp_steps} ({ramp_epochs_float:.2f} epochs)"
+        )
+    if is_main_process() and "side_tuning" in param_group_names:
+        side_ramp_epochs_float = float(side_ramp_steps) / float(max(steps_per_epoch, 1))
+        print(
+            f"[sched] side_tuning_start_factor={side_start_factor:.3f}, "
+            f"side_tuning_ramp_steps={side_ramp_steps} ({side_ramp_epochs_float:.2f} epochs)"
         )
 
     # ---- EMA (Exponential Moving Average) ----

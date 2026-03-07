@@ -35,13 +35,13 @@ model:
   image_size: 256
   focal_length: 5000
   # Ablation: disable geometry prior branch (MoGe2) and use RGB only.
-  use_geo_prior: true # 设置为True时开启双模态token融合，为False时单RGB输入
+  use_geo_prior: false # 设置为True时开启双模态token融合，为False时单RGB输入
   # MoGe2 inference token budget (controls MoGe2 internal resolution / compute).
   # - This is NOT the ViT embed_dim (which is 1280) and NOT the final geo token length (which is pooled to 16x12=192).
   # - Larger values can improve MoGe2 point/feature quality but slow training significantly.
   # Suggested sweep: 400 (fast) / 800 / 1200 / 1800.
   # 800 gives denser geometry cues than 400, usually improving multimodal ceiling.
-  moge2_num_tokens: 800
+  moge2_num_tokens: 400
   # MoGe2 output mode for geometry tokens: neck (conv neck features) | points (xyz*mask + mask)
   moge2_output: neck
   # Token fusion mode: concat (concatenate tokens) or sum (element-wise sum) or cross_attn (cross-attention)
@@ -119,9 +119,9 @@ loss:
   w_kcr_2d: 1.0
   w_3d_joint: 5.0
   # Bone-length consistency (L1 on predicted vs GT bone lengths in 21-joint hand tree).
-  w_bone_length: 2.0
+  w_bone_length: 1.0
   # Emphasize fingertips in 3D joint loss to improve terminal-joint accuracy.
-  joint_3d_tip_weight: 2.0
+  joint_3d_tip_weight: 2.5
   tip_joint_indices: [4, 8, 12, 16, 20]
   # Canonical 21-joint hand kinematic tree (wrist -> each finger chain).
   bone_pairs:
@@ -146,8 +146,8 @@ loss:
     - [18, 19]
     - [19, 20]
   w_3d_vert: 0.0
-  w_global_orient: 1.0
-  w_hand_pose: 1.0
+  w_global_orient: 0.5
+  w_hand_pose: 0.5
   w_scale: 0.0
 
 
@@ -184,5 +184,5 @@ train:
   # Whether to run train-set metrics after each epoch
   eval_train_metrics: false #打印训练集的指标
   num_workers: 32
-  out_dir: /root/code/vepfs/GPGFormer/checkpoints/freihand_20260306_moge_800
+  out_dir: /root/code/vepfs/GPGFormer/checkpoints/ablations/freihand_20260307_rgb_only
   

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -10,7 +12,14 @@ class GeoSideTuning(nn.Module):
     Input/Output: (B, N_geo, C_geo)
     """
 
-    def __init__(self, geo_channels: int = 1280, side_channels: int = 256, dropout: float = 0.1):
+    def __init__(
+        self,
+        geo_channels: int = 1280,
+        side_channels: int = 256,
+        dropout: float = 0.1,
+        max_res_scale: float = 0.1,
+        init_res_scale: float = 1e-3,
+    ):
         super().__init__()
         self.side_net = nn.Sequential(
             nn.Linear(geo_channels, 512),
@@ -21,8 +30,14 @@ class GeoSideTuning(nn.Module):
             nn.Dropout(dropout),
         )
         self.fusion_proj = nn.Linear(geo_channels + side_channels, geo_channels)
-        # Learnable residual scale keeps start close to identity while allowing gradients.
-        self.res_scale = nn.Parameter(torch.tensor(1e-3))
+        # Bounded residual gate keeps geometric injection stable in late training.
+        if max_res_scale <= 0:
+            raise ValueError(f"max_res_scale must be > 0, got {max_res_scale}")
+        self.max_res_scale = float(max_res_scale)
+        init_ratio = float(init_res_scale) / self.max_res_scale
+        init_ratio = min(max(init_ratio, 1e-6), 1.0 - 1e-6)
+        init_logit = math.log(init_ratio / (1.0 - init_ratio))
+        self.res_scale_raw = nn.Parameter(torch.tensor(init_logit, dtype=torch.float32))
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -39,4 +54,5 @@ class GeoSideTuning(nn.Module):
         side_feat = self.side_net(geo_tokens)
         fused = torch.cat([geo_tokens, side_feat], dim=-1)
         delta = self.fusion_proj(fused)
-        return geo_tokens + self.res_scale * delta
+        res_scale = torch.sigmoid(self.res_scale_raw).to(dtype=geo_tokens.dtype) * self.max_res_scale
+        return geo_tokens + res_scale * delta

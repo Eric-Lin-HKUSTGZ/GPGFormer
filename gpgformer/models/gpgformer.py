@@ -60,6 +60,8 @@ class GPGFormerConfig:
     use_geo_side_tuning: bool = False
     geo_side_tuning_side_channels: int = 256
     geo_side_tuning_dropout: float = 0.1
+    geo_side_tuning_max_res_scale: float = 0.1
+    geo_side_tuning_init_res_scale: float = 1e-3
 
     # HaMeR-style MANO head (defaults are reasonable if not provided by YAML)
     mano_head_ief_iters: int = 3
@@ -133,6 +135,8 @@ class GPGFormer(nn.Module):
                 geo_channels=1280,
                 side_channels=int(getattr(cfg, "geo_side_tuning_side_channels", 256)),
                 dropout=float(getattr(cfg, "geo_side_tuning_dropout", 0.1)),
+                max_res_scale=float(getattr(cfg, "geo_side_tuning_max_res_scale", 0.1)),
+                init_res_scale=float(getattr(cfg, "geo_side_tuning_init_res_scale", 1e-3)),
             )
 
         self.encoder = WiLoRViTWithGeo(

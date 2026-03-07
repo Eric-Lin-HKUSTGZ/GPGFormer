@@ -1,21 +1,33 @@
 dataset:
-  name: freihand
+  name: ho3d
   img_size: 256
-  # Root joint index used for all root-relative ops (loss/eval). Default: 9 (middle MCP, FreiHAND convention).
+  # Root joint index used for all root-relative ops (loss/eval). Default: 9 (middle MCP).
   root_index: 9
-  # Use training set split for validation (9:1)
-  use_trainval_split: false
-  trainval_ratio: 0.9
-  trainval_seed: 42
+  ho3d_version: v3
+  # Split train.txt into train/val for metrics (HO3D evaluation split often lacks full GT joints)
+  ho3d_val_split: val
+  ho3d_eval_split: val
+  ho3d_trainval_ratio: 0.9
+  ho3d_trainval_seed: 42
+  ho3d_trainval_split_by: sequence  # sequence | frame
+  # Use JSON split files instead of train.txt/evaluation.txt + per-frame meta pkl.
+  ho3d_use_json_split: true
+  # JSON keypoints_3d unit handling for HO3DJsonDataset: auto | m | mm
+  ho3d_json_kp3d_unit: auto
+  # Extra multiplier after unit conversion.
+  ho3d_json_kp3d_scale: 1.0
+  # Optional coordinate conversion (x,y,z)->(x,-y,-z).
+  ho3d_json_convert_xyz: false
   align_wilor_aug: true
-  # Train uses GT bbox (from keypoints); eval/test uses detector bbox
-  bbox_source_eval: detector
+  # HO3D has labels for cropping (train/val: joints+K, evaluation/test: handBoundingBox).
+  # Keep this label-based and do not use a detector model.
+  bbox_source_eval: gt
   wilor_aug_config:
-    SCALE_FACTOR: 0.3 
-    ROT_FACTOR: 30 # 30
+    SCALE_FACTOR: 0.3
+    ROT_FACTOR: 30
     TRANS_FACTOR: 0.02
-    COLOR_SCALE: 0.2 # 0.2
-    ROT_AUG_RATE: 0.6 # 0.6
+    COLOR_SCALE: 0.2
+    ROT_AUG_RATE: 0.6
     TRANS_AUG_RATE: 0.5
     DO_FLIP: false
     FLIP_AUG_RATE: 0.0
@@ -23,8 +35,10 @@ dataset:
     EXTREME_CROP_AUG_LEVEL: 1
 
 paths:
-  freihand_root: /root/code/vepfs/dataset/FreiHAND_pub_v2
-  freihand_eval_root: /root/code/vepfs/dataset/FreiHAND_pub_v2_eval
+  ho3d_root: /root/code/vepfs/dataset/HO3D_v3
+  # Optional HO3D JSON split files for HO3DJsonDataset.
+  ho3d_train_json: /c20250503/lwq/dataset/handos_data/HO3Dv3/HO3D-train-normalized.json
+  ho3d_test_json: /c20250503/lwq/dataset/handos_data/HO3Dv3/HO3D-evaluation-meter.json
   wilor_ckpt: /root/code/vepfs/GPGFormer/weights/wilor_final.ckpt
   detector_ckpt: /root/code/vepfs/GPGFormer/weights/detector.pt
   moge2_ckpt: /root/code/vepfs/GPGFormer/weights/model.pt
@@ -35,13 +49,13 @@ model:
   image_size: 256
   focal_length: 5000
   # Ablation: disable geometry prior branch (MoGe2) and use RGB only.
-  use_geo_prior: true # 设置为True时开启双模态token融合，为False时单RGB输入
+  use_geo_prior: false # 设置为True时开启双模态token融合，为False时单RGB输入
   # MoGe2 inference token budget (controls MoGe2 internal resolution / compute).
   # - This is NOT the ViT embed_dim (which is 1280) and NOT the final geo token length (which is pooled to 16x12=192).
   # - Larger values can improve MoGe2 point/feature quality but slow training significantly.
   # Suggested sweep: 400 (fast) / 800 / 1200 / 1800.
   # 800 gives denser geometry cues than 400, usually improving multimodal ceiling.
-  moge2_num_tokens: 800
+  moge2_num_tokens: 400
   # MoGe2 output mode for geometry tokens: neck (conv neck features) | points (xyz*mask + mask)
   moge2_output: neck
   # Token fusion mode: concat (concatenate tokens) or sum (element-wise sum) or cross_attn (cross-attention)
@@ -119,9 +133,9 @@ loss:
   w_kcr_2d: 1.0
   w_3d_joint: 5.0
   # Bone-length consistency (L1 on predicted vs GT bone lengths in 21-joint hand tree).
-  w_bone_length: 2.0
+  w_bone_length: 1.0
   # Emphasize fingertips in 3D joint loss to improve terminal-joint accuracy.
-  joint_3d_tip_weight: 2.0
+  joint_3d_tip_weight: 2.5
   tip_joint_indices: [4, 8, 12, 16, 20]
   # Canonical 21-joint hand kinematic tree (wrist -> each finger chain).
   bone_pairs:
@@ -146,8 +160,8 @@ loss:
     - [18, 19]
     - [19, 20]
   w_3d_vert: 0.0
-  w_global_orient: 1.0
-  w_hand_pose: 1.0
+  w_global_orient: 0.5
+  w_hand_pose: 0.5
   w_scale: 0.0
 
 
@@ -184,5 +198,5 @@ train:
   # Whether to run train-set metrics after each epoch
   eval_train_metrics: false #打印训练集的指标
   num_workers: 32
-  out_dir: /root/code/vepfs/GPGFormer/checkpoints/freihand_20260306_moge_800
+  out_dir: /root/code/vepfs/GPGFormer/checkpoints/ablations/ho3d_20260307_rgb_only
   
