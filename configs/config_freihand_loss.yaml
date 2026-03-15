@@ -26,16 +26,19 @@ paths:
   freihand_root: /root/code/vepfs/dataset/FreiHAND_pub_v2
   freihand_eval_root: /root/code/vepfs/dataset/FreiHAND_pub_v2_eval
   wilor_ckpt: /root/code/vepfs/GPGFormer/weights/wilor_final.ckpt
+  vitpose_ckpt: /root/code/hand_reconstruction/WiLoR/pretrained_models/vitpose-l.pth
   detector_ckpt: /root/code/vepfs/GPGFormer/weights/detector.pt
   moge2_ckpt: /root/code/vepfs/GPGFormer/weights/model.pt
   mano_dir: /root/code/vepfs/GPGFormer/weights/mano
   mano_mean_params: /root/code/vepfs/GPGFormer/weights/mano/mano_mean_params.npz
 
 model:
+  # Backbone selection: wilor | vitpose
+  backbone_type: wilor
   image_size: 256
   focal_length: 5000
   # Ablation: disable geometry prior branch (MoGe2) and use RGB only.
-  use_geo_prior: false # 设置为True时开启双模态token融合，为False时单RGB输入
+  use_geo_prior: true # 设置为True时开启双模态token融合，为False时单RGB输入
   # MoGe2 inference token budget (controls MoGe2 internal resolution / compute).
   # - This is NOT the ViT embed_dim (which is 1280) and NOT the final geo token length (which is pooled to 16x12=192).
   # - Larger values can improve MoGe2 point/feature quality but slow training significantly.
@@ -184,5 +187,4 @@ train:
   # Whether to run train-set metrics after each epoch
   eval_train_metrics: false #打印训练集的指标
   num_workers: 32
-  out_dir: /root/code/vepfs/GPGFormer/checkpoints/ablations/freihand_20260307_rgb_only
-  
+  out_dir: /root/code/vepfs/GPGFormer/checkpoints/ablations/freihand_20260307_vitpose

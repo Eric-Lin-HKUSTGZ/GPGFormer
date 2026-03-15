@@ -1,0 +1,169 @@
+dataset:
+  name: freihand
+  img_size: 256
+  root_index: 9
+  use_trainval_split: false
+  trainval_ratio: 0.9
+  trainval_seed: 42
+  align_wilor_aug: true
+  bbox_source_eval: detector
+  wilor_aug_config:
+    SCALE_FACTOR: 0.25
+    ROT_FACTOR: 30
+    TRANS_FACTOR: 0.02
+    COLOR_SCALE: 0.10
+    ROT_AUG_RATE: 0.6
+    TRANS_AUG_RATE: 0.5
+    DO_FLIP: false
+    FLIP_AUG_RATE: 0.0
+    EXTREME_CROP_AUG_RATE: 0.0
+    EXTREME_CROP_AUG_LEVEL: 1
+
+paths:
+  freihand_root: /root/code/vepfs/dataset/FreiHAND_pub_v2
+  freihand_eval_root: /root/code/vepfs/dataset/FreiHAND_pub_v2_eval
+  wilor_ckpt: /root/code/vepfs/GPGFormer/weights/wilor_final.ckpt
+  vitpose_ckpt: /root/code/hand_reconstruction/WiLoR/pretrained_models/vitpose-l.pth
+  detector_ckpt: /root/code/vepfs/GPGFormer/weights/detector.pt
+  moge2_ckpt: /root/code/vepfs/GPGFormer/weights/model.pt
+  mano_dir: /root/code/vepfs/GPGFormer/weights/mano
+  mano_mean_params: /root/code/vepfs/GPGFormer/weights/mano/mano_mean_params.npz
+
+model:
+  backbone_type: vitpose
+  image_size: 256
+  focal_length: 5000
+
+  use_geo_prior: true
+  moge2_num_tokens: 400
+  moge2_output: neck
+
+  token_fusion_mode: sum
+  sum_fusion_strategy: channel_concat
+  fusion_proj_zero_init: true
+
+  cross_attn_num_heads: 8
+  cross_attn_dropout: 0.0
+  cross_attn_gate_init: 0.0
+
+  # VitPose 迁移时先关闭 side-tuning，避免中后期 camera scale 漂移导致 2D loss 崩坏
+  side_tuning:
+    enabled: false
+    side_channels: 256
+    dropout: 0.05
+    max_res_scale: 0.05
+    init_res_scale: 0.0001
+
+  geo_tokenizer_use_pooling: true
+
+  mano_decoder: wilor
+  freihand_mano_root: /root/code/hand_reconstruction/freihand/data
+
+  mano_head:
+    ief_iters: 3
+    transformer_input: mean_shape
+    dim: 1024
+    depth: 6
+    heads: 8
+    dim_head: 64
+    mlp_dim: 2048
+    dropout: 0.0
+
+  feature_refiner:
+    method: sjta
+    feat_dim: 1280
+
+    sjta_bottleneck_dim: 256
+    sjta_num_heads: 4
+    sjta_use_2d_prior: true
+    sjta_num_steps: 2
+
+    coear_dilation1: 1
+    coear_dilation2: 2
+    coear_gate_reduction: 8
+    coear_init_alpha: 0.1
+
+    wilor_msf_bottleneck_ratio: 4
+    wilor_msf_dilation1: 1
+    wilor_msf_dilation2: 2
+    wilor_msf_dilation3: 3
+    wilor_msf_gate_reduction: 8
+    wilor_msf_init_alpha: 0.1
+
+    kcr_num_keypoints: 21
+    kcr_hidden_dim: 128
+
+loss:
+  reduction: mean
+
+  w_2d: 1.0
+  w_kcr_2d: 0.5
+
+  w_3d_joint: 5.0
+  w_bone_length: 1.5
+
+  joint_3d_tip_weight: 2.5
+  tip_joint_indices: [4, 8, 12, 16, 20]
+
+  bone_pairs:
+    - [0, 1]
+    - [1, 2]
+    - [2, 3]
+    - [3, 4]
+    - [0, 5]
+    - [5, 6]
+    - [6, 7]
+    - [7, 8]
+    - [0, 9]
+    - [9, 10]
+    - [10, 11]
+    - [11, 12]
+    - [0, 13]
+    - [13, 14]
+    - [14, 15]
+    - [15, 16]
+    - [0, 17]
+    - [17, 18]
+    - [18, 19]
+    - [19, 20]
+
+  w_3d_vert: 0.2
+  w_global_orient: 0.2
+  w_hand_pose: 0.2
+  w_scale: 0.0
+
+train:
+  use_cuda: true
+  epochs: 120
+
+  batch_size: 96
+  val_batch_size: 96
+
+  lr: 5.0e-5
+  weight_decay: 1.0e-4
+
+  lr_multiplier:
+    backbone: 0.05
+    head: 1.2
+    geo_fusion: 0.2
+    side_tuning: 0.0
+
+  warmup_epochs: 10
+
+  geo_fusion_start_factor: 0.05
+  geo_fusion_ramp_epochs: 30
+
+  side_tuning_start_factor: 0.0
+  side_tuning_ramp_epochs: 1
+
+  min_lr: 5.0e-7
+  seed: 42
+  grad_clip_norm: 1.0
+
+  use_ema: false
+  ema_decay: 0.9998
+
+  eval_train_metrics: false
+  num_workers: 32
+
+  out_dir: /root/code/vepfs/GPGFormer/checkpoints/freihand_vitpose_stable

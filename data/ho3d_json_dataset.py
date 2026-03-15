@@ -250,7 +250,7 @@ class HO3DJsonDataset(Dataset):
             src = self.test_json_path
         st = os.stat(src)
         # Bump this when datalist semantics change (prevents stale, incompatible cache reuse).
-        cache_version = "v2_meta_supervision"
+        cache_version = "v4_meta_mano_mesh"
         key = (
             f"{cache_version}|{self.data_split}|{self.root_dir}|{self.train_json_path}|{self.test_json_path}|"
             f"{self.trainval_ratio}|{self.trainval_seed}|{self.trainval_split_by}|"
@@ -305,28 +305,31 @@ class HO3DJsonDataset(Dataset):
             val_ids.append(train_ids.pop())
         return train_ids, val_ids
 
-    def _kp3d_postprocess(self, kp3d: np.ndarray) -> np.ndarray:
-        kp3d = np.asarray(kp3d, dtype=np.float32).reshape(-1, 3)
+    def _xyz3d_postprocess(self, xyz3d: np.ndarray) -> np.ndarray:
+        xyz3d = np.asarray(xyz3d, dtype=np.float32).reshape(-1, 3)
 
         unit = self.json_kp3d_unit
         if unit == "mm":
-            kp3d = kp3d / 1000.0
+            xyz3d = xyz3d / 1000.0
         elif unit == "auto":
             # Heuristic: values with very large depth are likely millimeters.
-            med = float(np.median(np.abs(kp3d[:, 2]))) if kp3d.shape[0] > 0 else 0.0
+            med = float(np.median(np.abs(xyz3d[:, 2]))) if xyz3d.shape[0] > 0 else 0.0
             if med > 10.0:
-                kp3d = kp3d / 1000.0
+                xyz3d = xyz3d / 1000.0
         elif unit in ("m", "meter", "meters"):
             pass
         else:
             raise ValueError(f"Unsupported json_kp3d_unit: {self.json_kp3d_unit}")
 
-        kp3d = kp3d * self.json_kp3d_scale
+        xyz3d = xyz3d * self.json_kp3d_scale
         if self.json_convert_xyz:
-            kp3d = kp3d.copy()
-            kp3d[:, 1] *= -1.0
-            kp3d[:, 2] *= -1.0
-        return kp3d.astype(np.float32)
+            xyz3d = xyz3d.copy()
+            xyz3d[:, 1] *= -1.0
+            xyz3d[:, 2] *= -1.0
+        return xyz3d.astype(np.float32)
+
+    def _kp3d_postprocess(self, kp3d: np.ndarray) -> np.ndarray:
+        return self._xyz3d_postprocess(kp3d)
 
     def _build_datalist_from_json(self, json_path: str, split_mode: str) -> List[Dict[str, Any]]:
         images: Dict[int, Dict[str, Any]] = {}
@@ -460,7 +463,6 @@ class HO3DJsonDataset(Dataset):
             if kp3_raw is None:
                 continue
             kp3d = self._kp3d_postprocess(np.asarray(kp3_raw, dtype=np.float32).reshape(-1, 3))
-
             kp2_pack = ann.get("keypoints", None)
             if kp2_pack is not None:
                 kp2_pack = np.asarray(kp2_pack, dtype=np.float32).reshape(-1, 3)
@@ -746,7 +748,7 @@ class HO3DJsonDataset(Dataset):
             mano_trans = np.zeros((3,), dtype=np.float32)
 
         flip_perm = list(range(21))
-        img_patch, kp2d_norm, kp3d_aug, aug_mano_params, _has_params, _, trans = get_example(
+        img_patch, kp2d_norm, kp3d_aug, aug_mano_params, _has_params, _, trans, rot, do_flip = get_example(
             rgb,
             float(center[0]),
             float(center[1]),
@@ -766,6 +768,7 @@ class HO3DJsonDataset(Dataset):
             augm_config=self.wilor_aug_config,
             is_bgr=True,
             return_trans=True,
+            return_aug_params=True,
         )
 
         imgRGB_01 = torch.from_numpy(img_patch).float() / 255.0
@@ -807,7 +810,7 @@ class HO3DJsonDataset(Dataset):
 
         mano_params_is_axis_angle = {"global_orient": True, "hand_pose": True, "betas": False}
 
-        return {
+        out = {
             "rgb": imgRGB,
             "keypoints_2d": torch.from_numpy(kp2d_norm.astype(np.float32)).float(),
             "keypoints_3d": torch.from_numpy(kp3d_aug.astype(np.float32)).float(),
@@ -830,3 +833,4 @@ class HO3DJsonDataset(Dataset):
             "image_id": int(data.get("image_id", idx)),
             "file_name": str(data.get("file_name", "")),
         }
+        return out

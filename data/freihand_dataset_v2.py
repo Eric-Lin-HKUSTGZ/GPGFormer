@@ -58,6 +58,7 @@ class FreiHANDDatasetV2(Dataset):
                  trainval_ratio: float = 0.9,
                  trainval_seed: int = 42,
                  use_trainval_split: bool = True,
+                 load_vertices_gt: bool = True,
                  # New augmentation parameters
                  center_jitter_factor: float = 0.05,
                  brightness_limit: tuple = (-0.2, 0.1),
@@ -86,6 +87,7 @@ class FreiHANDDatasetV2(Dataset):
         self.trainval_ratio = float(trainval_ratio)
         self.trainval_seed = int(trainval_seed)
         self.use_trainval_split = bool(use_trainval_split)
+        self.load_vertices_gt = bool(load_vertices_gt)
 
         if isinstance(cube_size, (list, tuple, np.ndarray)):
             self.cube_size = list(cube_size)
@@ -137,13 +139,19 @@ class FreiHANDDatasetV2(Dataset):
         k_path = osp.join(base_root, f'{prefix}_K.json')
         mano_path = osp.join(base_root, f'{prefix}_mano.json')
         xyz_path = osp.join(base_root, f'{prefix}_xyz.json')
+        verts_path = osp.join(base_root, f'{prefix}_verts.json')
 
         self.K_list = _load_json(k_path)
         self.mano_list = _load_json(mano_path)
         self.xyz_list = _load_json(xyz_path)
+        self.verts_list = None
+        if self.load_vertices_gt and (not self.train) and osp.isfile(verts_path):
+            self.verts_list = _load_json(verts_path)
 
         if not (len(self.K_list) == len(self.mano_list) == len(self.xyz_list)):
             raise ValueError('FreiHAND annotation sizes do not match.')
+        if self.verts_list is not None and len(self.verts_list) != len(self.xyz_list):
+            raise ValueError('FreiHAND verts annotation size does not match xyz size.')
 
         # Count actual images in the directory
         num_images = len([f for f in os.listdir(self.img_dir) if f.endswith('.jpg')])
@@ -189,6 +197,11 @@ class FreiHANDDatasetV2(Dataset):
         global_orient = mano_params[:3]
         hand_pose = mano_params[3:48]
         hand_shape = mano_params[48:58]
+        if mano_params.shape[0] >= 61:
+            # FreiHAND stores translation in mm; convert to meters to match keypoints_3d.
+            mano_trans = (mano_params[58:61] / 1000.0).astype(np.float32)
+        else:
+            mano_trans = np.zeros((3,), dtype=np.float32)
 
         # 2D projection
         keypoints_2d = _project_points(keypoints_3d, K)
@@ -289,11 +302,12 @@ class FreiHANDDatasetV2(Dataset):
         if trans_coord_valid[self.root_index] == 0 and trans_coord_valid[0] == 0:
             xyz_valid = 0
 
-        return {
+        out = {
             'rgb': imgRGB,
             'keypoints_2d': torch.from_numpy(keypoints_2d).float(),
             'keypoints_3d': torch.from_numpy(keypoints_3d.astype(np.float32)).float(),
             'mano_params': mano_params,
+            'mano_trans': torch.from_numpy(mano_trans).float(),
             'cam_param': torch.tensor(cam_para, dtype=torch.float32),
             'box_center': torch.from_numpy(center.astype(np.float32)),
             'box_size': torch.tensor(bbox_size, dtype=torch.float32),
@@ -305,6 +319,10 @@ class FreiHANDDatasetV2(Dataset):
             'hand_type': 'right',
             'is_right': 1.0
         }
+        if self.verts_list is not None:
+            vertices_gt = np.array(self.verts_list[anno_idx], dtype=np.float32)
+            out['vertices_gt'] = torch.from_numpy(vertices_gt).float()
+        return out
 
 
 def main():
@@ -377,4 +395,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

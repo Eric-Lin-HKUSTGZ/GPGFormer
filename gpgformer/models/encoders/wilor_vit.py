@@ -20,6 +20,8 @@ class WiLoRViTConfig:
     joint_rep: str = "aa"  # "6d" or "aa"
     token_fusion_mode: str = "concat"  # "concat" | "sum" | "cross_attn"
     sum_fusion_strategy: str = "basic"  # "basic" | "weighted" | "normalized" | "weighted_normalized" | "channel_concat"
+    # Learnable scalar gate for geometry injection in sum mode; effective gate is sigmoid(param).
+    sum_geo_gate_init: float = 4.0
     # For sum+channel_concat, zero-init the last projection layer so x_fused starts from pure RGB features.
     fusion_proj_zero_init: bool = True
     # Cross-attention fusion settings
@@ -71,6 +73,7 @@ class WiLoRViTWithGeo(nn.Module):
             if self.sum_fusion_strategy in ["weighted", "weighted_normalized"]:
                 # Learnable fusion weight α, initialized to 0.5 for equal weighting
                 self.fusion_weight = nn.Parameter(torch.tensor(0.5))
+            self.sum_geo_gate = nn.Parameter(torch.tensor(float(getattr(cfg, "sum_geo_gate_init", 4.0))))
 
             if self.sum_fusion_strategy in ["normalized", "weighted_normalized"]:
                 # LayerNorm for each modality to handle scale mismatch
@@ -170,6 +173,61 @@ class WiLoRViTWithGeo(nn.Module):
         self._wilor_unexpected = unexpected
         self._wilor_skipped_mismatch = skipped
 
+    @staticmethod
+    def _apply_rgb_token_mask(
+        x: torch.Tensor,
+        hp: int,
+        wp: int,
+        mask_ratio: float,
+        mask_mode: str = "block",
+        mask_fill: str = "zero",
+    ) -> torch.Tensor:
+        """
+        Mask RGB patch tokens to simulate occlusion and encourage geometry usage.
+        - block: contiguous rectangular mask (default, closer to real hand/object occlusion)
+        - random: independent token masking
+        """
+        ratio = float(max(0.0, min(1.0, mask_ratio)))
+        if ratio <= 0.0:
+            return x
+
+        b, n, d = x.shape
+        if n != hp * wp:
+            return x
+
+        mode = str(mask_mode).lower()
+        fill = str(mask_fill).lower()
+
+        if mode == "random":
+            keep = (torch.rand((b, n), device=x.device) >= ratio).to(dtype=x.dtype)
+            if fill == "mean":
+                mean_tok = x.mean(dim=1, keepdim=True)  # (B,1,D)
+                return x * keep.unsqueeze(-1) + (1.0 - keep.unsqueeze(-1)) * mean_tok
+            return x * keep.unsqueeze(-1)
+
+        # default: block mask
+        grid = x.view(b, hp, wp, d)
+        mask = torch.zeros((b, hp, wp), device=x.device, dtype=torch.bool)
+        target_area = max(1, int(round(float(hp * wp) * ratio)))
+        aspect = float(wp) / float(max(hp, 1))
+        for bi in range(b):
+            jitter = float(torch.empty((), device=x.device).uniform_(0.8, 1.2).item())
+            area = max(1, min(hp * wp, int(round(target_area * jitter))))
+            h_blk = max(1, int(round((area / max(aspect, 1e-6)) ** 0.5)))
+            w_blk = max(1, int(round(float(area) / float(h_blk))))
+            h_blk = min(h_blk, hp)
+            w_blk = min(w_blk, wp)
+            top = int(torch.randint(0, hp - h_blk + 1, (1,), device=x.device).item())
+            left = int(torch.randint(0, wp - w_blk + 1, (1,), device=x.device).item())
+            mask[bi, top:top + h_blk, left:left + w_blk] = True
+
+        if fill == "mean":
+            mean_tok = grid.mean(dim=(1, 2), keepdim=True)  # (B,1,1,D)
+            grid = torch.where(mask.unsqueeze(-1), mean_tok.expand_as(grid), grid)
+        else:
+            grid = grid.masked_fill(mask.unsqueeze(-1), 0.0)
+        return grid.view(b, n, d)
+
     def forward(
         self,
         img: torch.Tensor,
@@ -195,6 +253,18 @@ class WiLoRViTWithGeo(nn.Module):
         if self.backbone.pos_embed is not None:
             x = x + self.backbone.pos_embed[:, 1:] + self.backbone.pos_embed[:, :1]
 
+        # Optional RGB token masking (training-only); simulates occlusion to encourage geo prior usage.
+        apply_rgb_mask = bool(kwargs.get("apply_rgb_token_mask", False)) and self.training
+        if apply_rgb_mask:
+            x = self._apply_rgb_token_mask(
+                x=x,
+                hp=Hp,
+                wp=Wp,
+                mask_ratio=float(kwargs.get("rgb_mask_ratio", 0.0)),
+                mask_mode=str(kwargs.get("rgb_mask_mode", "block")),
+                mask_fill=str(kwargs.get("rgb_mask_fill", "zero")),
+            )
+
         # Token fusion: concat or sum
         if self.token_fusion_mode == "sum":
             # Sum mode: element-wise add geo_tokens and patch tokens, then add positional encoding
@@ -203,29 +273,30 @@ class WiLoRViTWithGeo(nn.Module):
                     raise ValueError(f"geo_tokens dim {geo_tokens.shape[-1]} != {self.backbone.embed_dim}")
                 if geo_tokens.shape[1] != x.shape[1]:
                     raise ValueError(f"geo_tokens length {geo_tokens.shape[1]} != patch tokens length {x.shape[1]}")
+                geo_gate = torch.sigmoid(self.sum_geo_gate).to(dtype=x.dtype, device=x.device)
 
                 # Apply different fusion strategies
                 if self.sum_fusion_strategy == "basic":
                     # Original: direct element-wise sum
-                    x = x + geo_tokens
+                    x = x + geo_gate * geo_tokens
 
                 elif self.sum_fusion_strategy == "weighted":
                     # Weighted sum: z = α*x + (1-α)*geo_tokens
                     alpha = torch.sigmoid(self.fusion_weight)  # Constrain to [0,1]
-                    x = alpha * x + (1 - alpha) * geo_tokens
+                    x = alpha * x + (1 - alpha) * (geo_gate * geo_tokens)
 
                 elif self.sum_fusion_strategy == "normalized":
                     # Normalize each modality before summing
                     x_norm = self.patch_norm(x)
                     geo_norm = self.geo_norm(geo_tokens)
-                    x = x_norm + geo_norm
+                    x = x_norm + geo_gate * geo_norm
 
                 elif self.sum_fusion_strategy == "weighted_normalized":
                     # Combine both: normalize then weighted sum
                     x_norm = self.patch_norm(x)
                     geo_norm = self.geo_norm(geo_tokens)
                     alpha = torch.sigmoid(self.fusion_weight)  # Constrain to [0,1]
-                    x = alpha * x_norm + (1 - alpha) * geo_norm
+                    x = alpha * x_norm + (1 - alpha) * (geo_gate * geo_norm)
 
                 elif self.sum_fusion_strategy == "channel_concat":
                     # Token-wise channel concatenation + projection
@@ -236,7 +307,7 @@ class WiLoRViTWithGeo(nn.Module):
                     # Concatenate along channel dimension
                     z = torch.cat([x_norm, geo_norm], dim=-1)  # (B, N, 2D)
                     # Project and add residual connection
-                    x = x + self.fusion_proj(z)  # (B, N, D)
+                    x = x + geo_gate * self.fusion_proj(z)  # (B, N, D)
 
                 else:
                     raise ValueError(f"Unknown sum_fusion_strategy: {self.sum_fusion_strategy}")

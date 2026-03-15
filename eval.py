@@ -108,9 +108,9 @@ def build_dataset(cfg: dict):
         )
 
     if name in ("freihand",):
-        from data.freihand_dataset_v2 import FreiHANDDatasetV2
+        from data.freihand_dataset_v3 import FreiHANDDatasetV3
 
-        return FreiHANDDatasetV2(
+        return FreiHANDDatasetV3(
             root_dir=cfg["paths"]["freihand_root"],
             eval_root=cfg["paths"].get("freihand_eval_root", None),
             img_size=int(cfg["dataset"].get("img_size", 256)),

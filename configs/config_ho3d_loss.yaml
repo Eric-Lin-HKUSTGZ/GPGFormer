@@ -21,7 +21,7 @@ dataset:
   align_wilor_aug: true
   # HO3D has labels for cropping (train/val: joints+K, evaluation/test: handBoundingBox).
   # Keep this label-based and do not use a detector model.
-  bbox_source_eval: gt
+  bbox_source_eval: detector
   wilor_aug_config:
     SCALE_FACTOR: 0.3
     ROT_FACTOR: 30
@@ -49,7 +49,7 @@ model:
   image_size: 256
   focal_length: 5000
   # Ablation: disable geometry prior branch (MoGe2) and use RGB only.
-  use_geo_prior: false # 设置为True时开启双模态token融合，为False时单RGB输入
+  use_geo_prior: true # 设置为True时开启双模态token融合，为False时单RGB输入
   # MoGe2 inference token budget (controls MoGe2 internal resolution / compute).
   # - This is NOT the ViT embed_dim (which is 1280) and NOT the final geo token length (which is pooled to 16x12=192).
   # - Larger values can improve MoGe2 point/feature quality but slow training significantly.
@@ -198,5 +198,5 @@ train:
   # Whether to run train-set metrics after each epoch
   eval_train_metrics: false #打印训练集的指标
   num_workers: 32
-  out_dir: /root/code/vepfs/GPGFormer/checkpoints/ablations/ho3d_20260307_rgb_only
+  out_dir: /root/code/vepfs/GPGFormer/checkpoints/ablations/ho3d_20260307
   

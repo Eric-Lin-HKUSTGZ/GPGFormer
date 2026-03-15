@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from smplx.lbs import vertices2joints
 
 from gpgformer.models.encoders.wilor_vit import WiLoRViTConfig, WiLoRViTWithGeo
+from gpgformer.models.encoders.vitpose_vit import ViTPoseViTConfig, ViTPoseViTWithGeo
 from gpgformer.models.heads.mano_head import MANOHeadConfig, MANOTransformerDecoderHead
 from gpgformer.models.heads.feature_refiner import FeatureRefinerConfig, build_feature_refiner
 from gpgformer.models.mano.mano_layer import MANOConfig, MANOLayer
@@ -23,9 +24,11 @@ from gpgformer.models.tokenizers.geo_side_tuning import GeoSideTuning
 @dataclass(frozen=True)
 class GPGFormerConfig:
     # Weights
-    wilor_ckpt_path: str
-    mano_model_path: str
-    mano_mean_params: str
+    backbone_type: str = "wilor"  # "wilor" | "vitpose"
+    wilor_ckpt_path: str = ""
+    vitpose_ckpt_path: str = ""
+    mano_model_path: str = ""
+    mano_mean_params: str = ""
     # Geometry prior (MoGe2)
     # - When use_geo_prior=False, moge2_weights_path may be None/empty and MoGe2 will not be loaded/run.
     moge2_weights_path: Optional[str] = None
@@ -49,6 +52,8 @@ class GPGFormerConfig:
     # Token fusion mode
     token_fusion_mode: str = "concat"  # "concat" | "sum" | "cross_attn"
     sum_fusion_strategy: str = "basic"  # "basic" | "weighted" | "normalized" | "weighted_normalized" | "channel_concat"
+    # Learnable scalar gate for geometry injection in sum mode; effective gate is sigmoid(param).
+    sum_geo_gate_init: float = 4.0
     fusion_proj_zero_init: bool = True
     # Cross-attention fusion settings (only used when token_fusion_mode="cross_attn")
     cross_attn_num_heads: int = 8
@@ -62,6 +67,8 @@ class GPGFormerConfig:
     geo_side_tuning_dropout: float = 0.1
     geo_side_tuning_max_res_scale: float = 0.1
     geo_side_tuning_init_res_scale: float = 1e-3
+    # Modality dropout for geometry tokens during training (0 disables).
+    geo_branch_dropout_prob: float = 0.0
 
     # HaMeR-style MANO head (defaults are reasonable if not provided by YAML)
     mano_head_ief_iters: int = 3
@@ -139,20 +146,39 @@ class GPGFormer(nn.Module):
                 init_res_scale=float(getattr(cfg, "geo_side_tuning_init_res_scale", 1e-3)),
             )
 
-        self.encoder = WiLoRViTWithGeo(
-            WiLoRViTConfig(
-                wilor_ckpt_path=cfg.wilor_ckpt_path,
-                mano_mean_params=cfg.mano_mean_params,
-                image_size=cfg.image_size,
-                joint_rep="aa",
-                token_fusion_mode=cfg.token_fusion_mode,
-                sum_fusion_strategy=getattr(cfg, 'sum_fusion_strategy', 'basic'),
-                fusion_proj_zero_init=bool(getattr(cfg, "fusion_proj_zero_init", True)),
-                cross_attn_num_heads=getattr(cfg, 'cross_attn_num_heads', 8),
-                cross_attn_dropout=getattr(cfg, 'cross_attn_dropout', 0.0),
-                cross_attn_gate_init=getattr(cfg, 'cross_attn_gate_init', 0.0),
+        backbone_type = getattr(cfg, 'backbone_type', 'wilor').lower()
+        if backbone_type == "vitpose":
+            self.encoder = ViTPoseViTWithGeo(
+                ViTPoseViTConfig(
+                    vitpose_ckpt_path=cfg.vitpose_ckpt_path,
+                    mano_mean_params=cfg.mano_mean_params,
+                    image_size=cfg.image_size,
+                    joint_rep="aa",
+                    token_fusion_mode=cfg.token_fusion_mode,
+                    sum_fusion_strategy=getattr(cfg, 'sum_fusion_strategy', 'basic'),
+                    sum_geo_gate_init=float(getattr(cfg, "sum_geo_gate_init", 4.0)),
+                    fusion_proj_zero_init=bool(getattr(cfg, "fusion_proj_zero_init", True)),
+                    cross_attn_num_heads=getattr(cfg, 'cross_attn_num_heads', 8),
+                    cross_attn_dropout=getattr(cfg, 'cross_attn_dropout', 0.0),
+                    cross_attn_gate_init=getattr(cfg, 'cross_attn_gate_init', 0.0),
+                )
             )
-        )
+        else:
+            self.encoder = WiLoRViTWithGeo(
+                WiLoRViTConfig(
+                    wilor_ckpt_path=cfg.wilor_ckpt_path,
+                    mano_mean_params=cfg.mano_mean_params,
+                    image_size=cfg.image_size,
+                    joint_rep="aa",
+                    token_fusion_mode=cfg.token_fusion_mode,
+                    sum_fusion_strategy=getattr(cfg, 'sum_fusion_strategy', 'basic'),
+                    sum_geo_gate_init=float(getattr(cfg, "sum_geo_gate_init", 4.0)),
+                    fusion_proj_zero_init=bool(getattr(cfg, "fusion_proj_zero_init", True)),
+                    cross_attn_num_heads=getattr(cfg, 'cross_attn_num_heads', 8),
+                    cross_attn_dropout=getattr(cfg, 'cross_attn_dropout', 0.0),
+                    cross_attn_gate_init=getattr(cfg, 'cross_attn_gate_init', 0.0),
+                )
+            )
 
         # HaMeR-style MANO regression head (cross-attn decoder + IEF)
         self.mano_head = MANOTransformerDecoderHead(
@@ -310,7 +336,15 @@ class GPGFormer(nn.Module):
         ).to(device=device, dtype=dtype)
         self._freihand_mano_layer.eval()
 
-    def forward(self, img_01: torch.Tensor, cam_param: Optional[torch.Tensor] = None) -> Dict[str, Any]:
+    def forward(
+        self,
+        img_01: torch.Tensor,
+        cam_param: Optional[torch.Tensor] = None,
+        apply_rgb_token_mask: bool = False,
+        rgb_mask_ratio: float = 0.0,
+        rgb_mask_mode: str = "block",
+        rgb_mask_fill: str = "zero",
+    ) -> Dict[str, Any]:
         """
         Args:
             img_01: (B,3,H,W) cropped RGB.
@@ -358,6 +392,16 @@ class GPGFormer(nn.Module):
             geo_tokens, coords = self.geo_tokenizer(geo_feat)  # (B,N2,1280), (Hg,Wg,2)
             if self.geo_side_tuning is not None:
                 geo_tokens = self.geo_side_tuning(geo_tokens)
+            geo_drop_prob = float(getattr(self.cfg, "geo_branch_dropout_prob", 0.0))
+            if self.training and geo_drop_prob > 0.0:
+                geo_drop_prob = min(max(geo_drop_prob, 0.0), 1.0)
+                if geo_drop_prob >= 1.0:
+                    geo_tokens = torch.zeros_like(geo_tokens)
+                else:
+                    keep = (torch.rand((geo_tokens.shape[0], 1, 1), device=geo_tokens.device) >= geo_drop_prob).to(
+                        dtype=geo_tokens.dtype
+                    )
+                    geo_tokens = geo_tokens * keep / (1.0 - geo_drop_prob)
             geo_pos = self.geo_pos(coords)  # (N2,1280)
 
         # WiLoR expects ImageNet normalization.
@@ -370,7 +414,16 @@ class GPGFormer(nn.Module):
                 raise ValueError(f"cam_param must be (B,4) or (B,>=2), got {tuple(cam_param.shape)}")
             focal_length_px = cam_param[:, :2]
 
-        enc_out = self.encoder(img_wilor, geo_tokens=geo_tokens, geo_pos=geo_pos, focal_length_px=focal_length_px)
+        enc_out = self.encoder(
+            img_wilor,
+            geo_tokens=geo_tokens,
+            geo_pos=geo_pos,
+            focal_length_px=focal_length_px,
+            apply_rgb_token_mask=apply_rgb_token_mask,
+            rgb_mask_ratio=rgb_mask_ratio,
+            rgb_mask_mode=rgb_mask_mode,
+            rgb_mask_fill=rgb_mask_fill,
+        )
         img_feat = enc_out["img_feat"]
         if self.feature_refiner is not None and self.feature_refiner.is_feature_enhancer:
             img_feat = self.feature_refiner.enhance_features(img_feat)

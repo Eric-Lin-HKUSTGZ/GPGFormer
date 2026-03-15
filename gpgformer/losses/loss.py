@@ -216,10 +216,29 @@ class BoneLengthLoss(nn.Module):
 
 
 class ParameterLoss(nn.Module):
-    def __init__(self, reduction: str = "mean"):
+    def __init__(
+        self,
+        reduction: str = "mean",
+        loss_type: str = "smooth_l1",
+        smooth_l1_beta: float = 0.05,
+        per_sample_clip: float = 0.25,
+    ):
         super().__init__()
         self.reduction = str(reduction)
+        normalized = str(loss_type).strip().lower().replace("-", "_")
+        if normalized == "l2":
+            normalized = "mse"
+        elif normalized == "mae":
+            normalized = "l1"
+        self.loss_type = normalized
+        self.smooth_l1_beta = float(max(smooth_l1_beta, 1e-8))
+        self.per_sample_clip = float(per_sample_clip)
         self.mse = nn.MSELoss(reduction="none")
+        self.l1 = nn.L1Loss(reduction="none")
+        if self.loss_type not in ("mse", "l1", "smooth_l1"):
+            raise ValueError(
+                f"Unsupported ParameterLoss loss_type={loss_type}. Expected one of: mse | l1 | smooth_l1 (aliases: l2->mse, mae->l1)"
+            )
 
     def forward(self, pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         if pred.shape != gt.shape:
@@ -227,7 +246,17 @@ class ParameterLoss(nn.Module):
         mask = mask.to(device=pred.device).bool().view(-1)
         if mask.numel() != pred.shape[0]:
             raise ValueError(f"ParameterLoss mask mismatch: mask={tuple(mask.shape)} pred_B={pred.shape[0]}")
-        per = self.mse(pred, gt).mean(dim=-1)  # (B,)
+        if self.loss_type == "mse":
+            per_elem = self.mse(pred, gt)
+        elif self.loss_type == "l1":
+            per_elem = self.l1(pred, gt)
+        else:
+            per_elem = torch.nn.functional.smooth_l1_loss(
+                pred, gt, reduction="none", beta=self.smooth_l1_beta
+            )
+        per = per_elem.mean(dim=-1)  # (B,)
+        if self.per_sample_clip > 0.0:
+            per = torch.clamp(per, max=self.per_sample_clip)
         per = per[mask]
         if per.numel() == 0:
             return pred.sum() * 0.0
@@ -254,10 +283,15 @@ class UTNetLoss(nn.Module):
         w_global_orient: float = 1.0,
         w_hand_pose: float = 1.0,
         w_betas: float = 0.0,
+        # # Shape regularization on predicted MANO betas (L2 norm).
+        w_shape: float = 0.0,
         joint_3d_tip_weight: float = 1.0,
         tip_joint_indices: Optional[Sequence[int]] = None,
         bone_pairs: Optional[Sequence[Sequence[int]]] = None,
         root_index: int = 9,
+        mano_param_loss_type: str = "smooth_l1",
+        mano_param_smooth_l1_beta: float = 0.05,
+        mano_param_per_sample_clip: float = 0.25,
         # keep signature compatible with train.py
         w_root_abs: float = 0.0,
         w_mano_trans: float = 0.0,
@@ -276,6 +310,8 @@ class UTNetLoss(nn.Module):
         self.w_global_orient = float(w_global_orient)
         self.w_hand_pose = float(w_hand_pose)
         self.w_betas = float(w_betas)
+        # `w_shape` regularizes the predicted MANO betas norm directly.
+        self.w_shape = float(w_shape)
         self.joint_3d_tip_weight = float(joint_3d_tip_weight)
         if tip_joint_indices is None:
             tip_joint_indices = self.DEFAULT_TIP_JOINT_INDICES
@@ -295,7 +331,12 @@ class UTNetLoss(nn.Module):
         self.loss_3d = Keypoint3DLoss(reduction=self.reduction)
         self.loss_bone = BoneLengthLoss(reduction=self.reduction)
         self.loss_vert = Vertex3DLoss(reduction=self.reduction)
-        self.param_loss = ParameterLoss(reduction=self.reduction)
+        self.param_loss = ParameterLoss(
+            reduction=self.reduction,
+            loss_type=mano_param_loss_type,
+            smooth_l1_beta=mano_param_smooth_l1_beta,
+            per_sample_clip=mano_param_per_sample_clip,
+        )
 
     @staticmethod
     def _require(d: Dict, key: str, where: str):
@@ -424,7 +465,7 @@ class UTNetLoss(nn.Module):
             out["loss_3d_vert"] = loss_v
             total = total + self.w_3d_vert * loss_v
 
-        if (self.w_global_orient > 0) or (self.w_hand_pose > 0) or (self.w_betas > 0):
+        if (self.w_global_orient > 0) or (self.w_hand_pose > 0) or (self.w_betas > 0) or (self.w_shape > 0):
             if not isinstance(pred_mano, dict):
                 raise TypeError(f"`predictions['mano_params']` must be dict, got {type(pred_mano)}")
             for k in ("global_orient", "hand_pose", "betas"):
@@ -481,6 +522,17 @@ class UTNetLoss(nn.Module):
                 )
                 out["loss_betas"] = loss_b
                 total = total + self.w_betas * loss_b
+
+            if self.w_shape > 0:
+                betas_flat = pred_mano["betas"].reshape(B, -1)
+                per = torch.linalg.norm(betas_flat, ord=2, dim=-1)
+                per = per[has_b]
+                if per.numel() == 0:
+                    loss_shape = betas_flat.sum() * 0.0
+                else:
+                    loss_shape = per.sum() if self.reduction == "sum" else per.mean()
+                out["loss_shape"] = loss_shape
+                total = total + self.w_shape * loss_shape
 
         out["total_loss"] = total
         return out

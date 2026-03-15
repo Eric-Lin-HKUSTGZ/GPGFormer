@@ -146,6 +146,29 @@ def keypoint_3d_processing(keypoints_3d: np.array, flip_permutation: List[int],
     return keypoints_3d.astype(np.float32)
 
 
+def vertices_3d_processing(vertices_3d: np.array, rot: float, do_flip: bool) -> np.array:
+    """Apply the same in-plane (z-axis) rotation and optional left-right flip as keypoint_3d_processing.
+
+    This is used to keep mesh vertices consistent with augmented keypoints_3d during training.
+    """
+    v = np.asarray(vertices_3d, dtype=np.float32).copy()
+    if v.ndim != 2 or v.shape[1] < 3:
+        raise ValueError(f"vertices_3d must have shape (N,3[+]), got {v.shape}")
+
+    if do_flip:
+        # FreiHAND uses right-hand; horizontal flip corresponds to mirroring x in camera coordinates.
+        v[:, 0] = -v[:, 0]
+
+    rot_mat = np.eye(3, dtype=np.float32)
+    if rot != 0:
+        rot_rad = -rot * np.pi / 180.0
+        sn, cs = np.sin(rot_rad), np.cos(rot_rad)
+        rot_mat[0, :2] = [cs, -sn]
+        rot_mat[1, :2] = [sn, cs]
+    v[:, :3] = np.einsum("ij,kj->ki", rot_mat, v[:, :3])
+    return v.astype(np.float32)
+
+
 # 把 MANO 的轴角（axis-angle / Rodrigues 向量）姿态参数按数据增强的“图像平面旋转角 rot”同步旋转，
 # 从而保证“图像旋转了多少，手的全局朝向（global_orient）也跟着在相机坐标里转多少”，两者保持一致。
 def rot_aa(aa: np.array, rot: float) -> np.array:
@@ -186,7 +209,8 @@ def get_example(img: np.array, center_x: float, center_y: float,
                 mean: np.array, std: np.array,
                 do_augment: bool, is_right: bool, augm_config: Dict,
                 is_bgr: bool = True,
-                return_trans: bool = False) -> Tuple:
+                return_trans: bool = False,
+                return_aug_params: bool = False) -> Tuple:
     cvimg = img.copy()
     img_height, img_width, img_channels = cvimg.shape
     img_size = np.array([img_height, img_width])
@@ -234,5 +258,9 @@ def get_example(img: np.array, center_x: float, center_y: float,
     keypoints_2d[:, 1] = keypoints_2d[:, 1] / patch_height - 0.5
 
     if not return_trans:
-        return img_patch, keypoints_2d, keypoints_3d, mano_params, has_mano_params, img_size
-    return img_patch, keypoints_2d, keypoints_3d, mano_params, has_mano_params, img_size, trans
+        if not return_aug_params:
+            return img_patch, keypoints_2d, keypoints_3d, mano_params, has_mano_params, img_size
+        return img_patch, keypoints_2d, keypoints_3d, mano_params, has_mano_params, img_size, rot, do_flip
+    if not return_aug_params:
+        return img_patch, keypoints_2d, keypoints_3d, mano_params, has_mano_params, img_size, trans
+    return img_patch, keypoints_2d, keypoints_3d, mano_params, has_mano_params, img_size, trans, rot, do_flip

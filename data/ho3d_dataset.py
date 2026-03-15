@@ -107,6 +107,27 @@ def _bbox_from_keypoints(keypoints_2d: np.ndarray, w: int, h: int) -> Tuple[np.n
     return center.astype(np.float32), scale_px.astype(np.float32), coord_valid
 
 
+def _bbox_from_detector(
+    detector,
+    rgb: np.ndarray,
+    w: int,
+    h: int,
+    img_path: str,
+    expand_factor: float = 1.2,
+) -> Tuple[np.ndarray, np.ndarray]:
+    bb = detector(rgb)
+    bb = _sanitize_bbox_xyxy(bb, w, h) if bb is not None else None
+    if bb is None:
+        raise RuntimeError(f"Detector failed to produce a valid hand bbox for image: {img_path}")
+    x1, y1, x2, y2 = bb.tolist()
+    bw = max(x2 - x1, 2.0)
+    bh = max(y2 - y1, 2.0)
+    center = np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0], dtype=np.float32)
+    scale_px = np.array([bw * float(expand_factor), bh * float(expand_factor)], dtype=np.float32)
+    scale_px = np.maximum(scale_px, 2.0)
+    return center, scale_px
+
+
 def _ho3d_cam_to_std_xyz(xyz: np.ndarray) -> np.ndarray:
     """
     Convert HO3D camera coords to the repo's standard camera coords.
@@ -181,17 +202,18 @@ class HO3DDataset(Dataset):
         self.wilor_aug_config = wilor_aug_config or {}
 
         self.bbox_source = str(bbox_source).lower()
-        # IMPORTANT:
-        # HO3D provides labels that are sufficient for hand crop:
-        # - train/val: full 3D joints + K -> project to 2D -> bbox from keypoints
-        # - evaluation/test: `handBoundingBox` in the meta pickle
-        # Do NOT use a detector model here (avoid Ultralytics/YOLO dependency and keep behavior
-        # consistent with label-based cropping used in this repo).
+        self.detector = None
+        self.detector_bbox_expand = 1.2
         if self.bbox_source == "detector":
+            if detector_weights_path is None or len(str(detector_weights_path).strip()) == 0:
+                raise ValueError("HO3DDataset bbox_source='detector' requires detector_weights_path.")
+            from gpgformer.models.detector.wilor_yolo import WiLoRDetectorConfig, WiLoRYOLODetector
+
+            self.detector = WiLoRYOLODetector(WiLoRDetectorConfig(weights_path=str(detector_weights_path)))
             if str(os.environ.get("RANK", "0")) == "0":
-                print("[warn] HO3D bbox_source='detector' is disabled; using label-based crop instead.")
-            self.bbox_source = "gt"
-        _ = detector_weights_path  # kept for config compatibility; intentionally unused for HO3D
+                print("[info] HO3DDataset uses detector-only hand crop (no label bbox fallback).")
+        elif self.bbox_source != "gt":
+            raise ValueError(f"Unsupported bbox_source for HO3DDataset: {self.bbox_source}")
 
         self.trainval_ratio = float(trainval_ratio)
         self.trainval_seed = int(trainval_seed)
@@ -449,7 +471,13 @@ class HO3DDataset(Dataset):
             keypoints_3d = joints_wilor.astype(np.float32)
             keypoints_2d = _project_points(keypoints_3d, K).astype(np.float32)  # (21,2) in pixels
 
-            center, scale_px, coord_valid = _bbox_from_keypoints(keypoints_2d, w, h)
+            center_gt, scale_px_gt, coord_valid = _bbox_from_keypoints(keypoints_2d, w, h)
+            if self.bbox_source == "detector":
+                center, scale_px = _bbox_from_detector(
+                    self.detector, rgb, w, h, rgb_path, expand_factor=self.detector_bbox_expand
+                )
+            else:
+                center, scale_px = center_gt, scale_px_gt
 
             bbox_size = float(scale_px.max())
             denom = float(max(float(scale_px.max()), 1e-6))
@@ -485,15 +513,20 @@ class HO3DDataset(Dataset):
             keypoints_3d = np.zeros((21, 3), dtype=np.float32)
             coord_valid = np.zeros((21,), dtype=np.float32)
 
-            bbox = data.get("handBoundingBox", None)
-            bb = _sanitize_bbox_xyxy(np.array(bbox, dtype=np.float32), w, h) if bbox is not None else None
-            if bb is not None:
-                x1, y1, x2, y2 = bb.tolist()
-                center = np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0], dtype=np.float32)
-                scale_px = np.array([(x2 - x1) * 1.2, (y2 - y1) * 1.2], dtype=np.float32)
+            if self.bbox_source == "detector":
+                center, scale_px = _bbox_from_detector(
+                    self.detector, rgb, w, h, rgb_path, expand_factor=self.detector_bbox_expand
+                )
             else:
-                center = np.array([w / 2.0, h / 2.0], dtype=np.float32)
-                scale_px = np.array([float(max(w, h)), float(max(w, h))], dtype=np.float32)
+                bbox = data.get("handBoundingBox", None)
+                bb = _sanitize_bbox_xyxy(np.array(bbox, dtype=np.float32), w, h) if bbox is not None else None
+                if bb is not None:
+                    x1, y1, x2, y2 = bb.tolist()
+                    center = np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0], dtype=np.float32)
+                    scale_px = np.array([(x2 - x1) * 1.2, (y2 - y1) * 1.2], dtype=np.float32)
+                else:
+                    center = np.array([w / 2.0, h / 2.0], dtype=np.float32)
+                    scale_px = np.array([float(max(w, h)), float(max(w, h))], dtype=np.float32)
 
             bbox_size = float(scale_px.max())
             denom = float(max(float(scale_px.max()), 1e-6))

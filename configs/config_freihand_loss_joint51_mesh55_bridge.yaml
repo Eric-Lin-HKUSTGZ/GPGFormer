@@ -1,0 +1,241 @@
+dataset:
+  name: freihand
+  img_size: 256
+  # Root joint index used for all root-relative ops (loss/eval). Default: 9 (middle MCP, FreiHAND convention).
+  root_index: 9
+  # Use training set split for validation (9:1)
+  use_trainval_split: false
+  trainval_ratio: 0.9
+  trainval_seed: 42
+  align_wilor_aug: true
+  # Train uses GT bbox (from keypoints); eval/test uses detector bbox
+  bbox_source_eval: detector
+  wilor_aug_config:
+    SCALE_FACTOR: 0.3 
+    ROT_FACTOR: 30 # 30
+    TRANS_FACTOR: 0.02
+    COLOR_SCALE: 0.2 # 0.2
+    ROT_AUG_RATE: 0.6 # 0.6
+    TRANS_AUG_RATE: 0.5
+    DO_FLIP: false
+    FLIP_AUG_RATE: 0.0
+    EXTREME_CROP_AUG_RATE: 0.0
+    EXTREME_CROP_AUG_LEVEL: 1
+
+paths:
+  freihand_root: /root/code/vepfs/dataset/FreiHAND_pub_v2
+  freihand_eval_root: /root/code/vepfs/dataset/FreiHAND_pub_v2_eval
+  wilor_ckpt: /root/code/vepfs/GPGFormer/weights/wilor_final.ckpt
+  vitpose_ckpt: /root/code/hand_reconstruction/WiLoR/pretrained_models/vitpose-l.pth
+  detector_ckpt: /root/code/vepfs/GPGFormer/weights/detector.pt
+  moge2_ckpt: /root/code/vepfs/GPGFormer/weights/model.pt
+  mano_dir: /root/code/vepfs/GPGFormer/weights/mano
+  mano_mean_params: /root/code/vepfs/GPGFormer/weights/mano/mano_mean_params.npz
+
+model:
+  # Backbone selection: wilor | vitpose
+  backbone_type: wilor
+  image_size: 256
+  focal_length: 5000
+  # Ablation: disable geometry prior branch (MoGe2) and use RGB only.
+  # Keep geometry prior on, but start from the same RGB-dominant fusion setting that historically trained stably.
+  use_geo_prior: true # 设置为True时开启双模态token融合，为False时单RGB输入
+  # MoGe2 inference token budget (controls MoGe2 internal resolution / compute).
+  # - This is NOT the ViT embed_dim (which is 1280) and NOT the final geo token length (which is pooled to 16x12=192).
+  # - Larger values can improve MoGe2 point/feature quality but slow training significantly.
+  # Suggested sweep: 400 (fast) / 800 / 1200 / 1800.
+  # 800 gives denser geometry cues than 400, usually improving multimodal ceiling.
+  moge2_num_tokens: 400
+  # MoGe2 output mode for geometry tokens: neck (conv neck features) | points (xyz*mask + mask)
+  moge2_output: neck
+  # Token fusion mode: concat (concatenate tokens) or sum (element-wise sum) or cross_attn (cross-attention)
+  token_fusion_mode: sum # concat | sum | cross_attn
+  # Sum fusion strategy (only used when token_fusion_mode=sum)
+  # Options: basic | weighted | normalized | weighted_normalized | channel_concat
+  # - channel_concat: Token-wise channel concatenation + projection (preserves info, learns alignment)
+  sum_fusion_strategy: channel_concat
+  # Start conservatively from RGB-dominant fusion, then learn geo usage.
+  # Avoid starting from geo-dominant gate (sigmoid~0.95), which can hurt late-stage stability.
+  sum_geo_gate_init: -1.2
+  # Zero-init the last projection layer in channel_concat fusion:
+  # start from pure RGB features, then gradually learn to inject geometry prior.
+  fusion_proj_zero_init: true
+  # Light geo dropout to prevent over-reliance on geometry priors in late epochs.
+  # Slightly milder geo dropout than the RGB-only ablation-derived file, to avoid underusing geometry.
+  geo_branch_dropout_prob: 0.05
+  # Cross-attention settings (only used when token_fusion_mode=cross_attn)
+  cross_attn_num_heads: 8
+  cross_attn_dropout: 0.0
+  # Gated residual scale for cross-attn branch. 0.0 means no geo injection at init.
+  cross_attn_gate_init: 0.0
+  # Optional side-tuning on geo tokens (applies only when use_geo_prior=true)
+  side_tuning:
+    enabled: false
+    side_channels: 256
+    dropout: 0.05
+    # Bounded residual gate: gate in [0, max_res_scale]
+    max_res_scale: 0.1
+    init_res_scale: 0.001
+  # GeoTokenizer pooling: set to false to keep full resolution (recommended for cross_attn)
+  geo_tokenizer_use_pooling: true
+  # MANO decoder selection for FreiHAND (align with FreiHAND toolbox)
+  mano_decoder: wilor # wilor | freihand_legacy
+  freihand_mano_root: /root/code/hand_reconstruction/freihand/data
+  mano_head:
+    # HaMeR-style MANO head (cross-attn TransformerDecoder + IEF)
+    ief_iters: 3
+    transformer_input: mean_shape  # mean_shape | zero
+    dim: 1024
+    depth: 6
+    heads: 8
+    dim_head: 64
+    mlp_dim: 2048
+    dropout: 0.0
+  # Feature Refiner: Lightweight feature refinement module
+  # Methods: 'sjta', 'coear', 'wilor_msf', 'kcr', 'none'
+  # - sjta: Sparse Joint Token Adapter (cross-attention based, ~1M params)
+  # - coear: Convolutional Edge/High-frequency Augmentation Refiner (~20K params)
+  # - wilor_msf: WiLoR-style multi-scale feature refinement
+  # - kcr: Keypoint Consistency Refinement (2D keypoint driven, ~50K params)
+  # - none: Disable feature refinement
+  feature_refiner:
+    method: sjta  # Options: sjta, coear, wilor_msf, kcr, none
+    feat_dim: 1280
+    # SJTA settings
+    sjta_bottleneck_dim: 256
+    sjta_num_heads: 4
+    sjta_use_2d_prior: true
+    sjta_num_steps: 2
+    # COEAR settings
+    coear_dilation1: 1
+    coear_dilation2: 2
+    coear_gate_reduction: 8
+    coear_init_alpha: 0.1
+    # WiLoR-MSF settings
+    wilor_msf_bottleneck_ratio: 4
+    wilor_msf_dilation1: 1
+    wilor_msf_dilation2: 2
+    wilor_msf_dilation3: 3
+    wilor_msf_gate_reduction: 8
+    wilor_msf_init_alpha: 0.1
+    # KCR settings
+    kcr_num_keypoints: 21
+    kcr_hidden_dim: 128
+
+loss:
+  reduction: mean
+  w_2d: 1.0
+  # Extra lightweight supervision for KCR heatmap/soft-argmax branch (only used when KCR is enabled)
+  w_kcr_2d: 1.0
+  w_3d_joint: 5.0
+  # Bone-length consistency (L1 on predicted vs GT bone lengths in 21-joint hand tree).
+  w_bone_length: 1.0
+  # Emphasize fingertips in 3D joint loss to improve terminal-joint accuracy.
+  joint_3d_tip_weight: 2.5
+  tip_joint_indices: [4, 8, 12, 16, 20]
+  # Canonical 21-joint hand kinematic tree (wrist -> each finger chain).
+  bone_pairs:
+    - [0, 1]
+    - [1, 2]
+    - [2, 3]
+    - [3, 4]
+    - [0, 5]
+    - [5, 6]
+    - [6, 7]
+    - [7, 8]
+    - [0, 9]
+    - [9, 10]
+    - [10, 11]
+    - [11, 12]
+    - [0, 13]
+    - [13, 14]
+    - [14, 15]
+    - [15, 16]
+    - [0, 17]
+    - [17, 18]
+    - [18, 19]
+    - [19, 20]
+  # Match the validated stable mesh supervision strength; 0.03 leaves the mesh branch too weak and produces a large PA gap.
+  w_3d_vert: 0.08
+  # Slightly softer MANO parameter weights reduce early over-constraint while keeping mesh supervision effective.
+  w_global_orient: 0.4
+  w_hand_pose: 0.4
+  w_scale: 0.0
+  # Add beta-norm regularization, which was important for keeping PA-MPVPE close to PA-MPJPE in the stable run.
+  w_shape: 0.06
+  # Robust MANO parameter supervision to suppress late-epoch outlier spikes.
+  mano_param_loss_type: smooth_l1
+  mano_param_smooth_l1_beta: 0.05
+  # 0.25 clips MANO pose losses too aggressively; the hand-pose term saturates at 0.25 in the log.
+  mano_param_per_sample_clip: 1.0
+
+
+train:
+  use_cuda: true
+  epochs: 50
+  batch_size: 96
+  val_batch_size: 96
+  lr: 2e-5
+  weight_decay: 1e-4
+  lr_multiplier:
+    # RGB trunk follows the proven RGB-only setting to keep early optimization fast/stable.
+    backbone: 0.5
+    # Slightly lower head LR to reduce late-stage oscillation.
+    head: 2.0
+    # Multimodal fusion parameters (geo tokenizer / fusion proj / cross-attn).
+    # Conservative geo_fusion update helps keep RGB/Geo co-adaptation stable.
+    geo_fusion: 0.25
+    # Only used when model.side_tuning.enabled=true
+    side_tuning: 0.8
+  warmup_epochs: 8
+  # Use a slower geo LR ramp so RGB branch remains dominant in early/mid training.
+  geo_fusion_start_factor: 0.05
+  geo_fusion_ramp_epochs: 20
+  # Dedicated side-tuning ramp to avoid late-stage instability.
+  side_tuning_start_factor: 0.1
+  side_tuning_ramp_epochs: 12
+  # Keep a small LR floor to avoid over-early freezing with masked training.
+  min_lr: 5e-7
+  seed: 42
+
+  # RGB token masking (occlusion simulation) for multimodal robustness.
+  rgb_token_mask:
+    enabled: false
+    # Keep supervised main path clean; apply mask on auxiliary consistency branch.
+    apply_to_main_forward: false
+    # Per-batch probability for the masked auxiliary branch.
+    apply_prob: 0.60
+    # Curriculum: gradually increase mask ratio from start to end.
+    ratio_start: 0.0
+    ratio_end: 0.10
+    ramp_epochs: 20
+    # block | random
+    mode: block
+    # zero | mean
+    fill: zero
+
+  # Consistency loss between clean and masked forward predictions (root-relative 3D joints).
+  consistency:
+    enabled: false
+    w_3d: 0.8
+    # Weight ramp from start_factor * w_3d to w_3d.
+    start_factor: 0.20
+    ramp_epochs: 12
+    # Run masked branch consistency on at most this many local samples per GPU
+    # to avoid OOM from dual full-batch forwards.
+    max_samples: 16
+
+  # Gradient clipping for training stability
+  grad_clip_norm: 1.0
+  # Exponential Moving Average (EMA) for model parameters
+  use_ema: false
+  ema_decay: 0.9998
+  # Whether to run train-set metrics after each epoch
+  eval_train_metrics: false #打印训练集的指标
+  # Select checkpoints by the joint+mesh average so slight mesh gains are preserved.
+  best_ckpt_metric: joint_mesh
+  num_workers: 32
+  out_dir: /root/code/vepfs/GPGFormer/checkpoints/freihand_loss_joint51_mesh55_bridge_gapfix_20260314
+
+metrics:
+  mesh_fallback_kp_consistency_thr_mm: 40.0

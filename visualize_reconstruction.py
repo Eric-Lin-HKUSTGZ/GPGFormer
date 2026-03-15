@@ -173,11 +173,83 @@ def warmup_lazy_modules(model: GPGFormer, cfg: dict, device: torch.device) -> No
 
 
 def project_points(points_3d: np.ndarray, cam_param: np.ndarray) -> np.ndarray:
+    # Some checkpoints/datasets use a camera convention where points in front of the
+    # camera have negative depth. Flip the whole cloud to a canonical +Z-forward frame;
+    # x/z and y/z stay unchanged, so the pixel projection remains identical while
+    # avoiding the huge blow-ups caused by clamping negative depths to a tiny +eps.
+    z_raw = np.asarray(points_3d[:, 2], dtype=np.float32)
+    finite = np.isfinite(z_raw)
+    nonzero = finite & (np.abs(z_raw) > 1e-8)
+    if np.any(nonzero):
+        depth_sign = 1.0 if float(np.median(z_raw[nonzero])) >= 0.0 else -1.0
+    else:
+        depth_sign = 1.0
+    pts = np.asarray(points_3d, dtype=np.float32) * depth_sign
+
     fx, fy, cx, cy = cam_param
-    z = np.maximum(points_3d[:, 2], 1e-6)
-    u = fx * (points_3d[:, 0] / z) + cx
-    v = fy * (points_3d[:, 1] / z) + cy
+    z = pts[:, 2]
+    z = np.where(np.abs(z) < 1e-6, np.where(z < 0.0, -1e-6, 1e-6), z)
+    u = fx * (pts[:, 0] / z) + cx
+    v = fy * (pts[:, 1] / z) + cy
     return np.stack([u, v], axis=-1)
+
+
+def solve_translation_from_2d_correspondences(
+    points_3d: np.ndarray,
+    points_2d: np.ndarray,
+    cam_param: np.ndarray,
+    valid: np.ndarray | None = None,
+) -> np.ndarray | None:
+    """
+    Solve camera translation t=(tx,ty,tz) from 3D-2D correspondences with fixed intrinsics.
+
+    For each correspondence:
+      (u - cx) / fx = (X + tx) / (Z + tz)
+      (v - cy) / fy = (Y + ty) / (Z + tz)
+
+    Rearranging yields a linear least-squares system in (tx, ty, tz):
+      tx - x_n * tz = x_n * Z - X
+      ty - y_n * tz = y_n * Z - Y
+    """
+    pts3 = np.asarray(points_3d, dtype=np.float32)
+    pts2 = np.asarray(points_2d, dtype=np.float32)
+    cam = np.asarray(cam_param, dtype=np.float32).reshape(-1)
+    if pts3.ndim != 2 or pts3.shape[1] != 3 or pts2.ndim != 2 or pts2.shape[1] != 2 or cam.shape[0] < 4:
+        return None
+
+    n = int(pts3.shape[0])
+    m = _as_valid_mask(valid, n)
+    finite = np.isfinite(pts3).all(axis=1) & np.isfinite(pts2).all(axis=1)
+    m &= finite
+    if int(m.sum()) < 2:
+        return None
+
+    fx, fy, cx, cy = [float(x) for x in cam[:4]]
+    if abs(fx) < 1e-8 or abs(fy) < 1e-8:
+        return None
+
+    sel3 = pts3[m]
+    sel2 = pts2[m]
+    xn = (sel2[:, 0] - cx) / fx
+    yn = (sel2[:, 1] - cy) / fy
+
+    a = np.zeros((sel3.shape[0] * 2, 3), dtype=np.float32)
+    b = np.zeros((sel3.shape[0] * 2,), dtype=np.float32)
+    a[0::2, 0] = 1.0
+    a[0::2, 2] = -xn
+    a[1::2, 1] = 1.0
+    a[1::2, 2] = -yn
+    b[0::2] = xn * sel3[:, 2] - sel3[:, 0]
+    b[1::2] = yn * sel3[:, 2] - sel3[:, 1]
+
+    try:
+        sol, *_ = np.linalg.lstsq(a, b, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    t = np.asarray(sol, dtype=np.float32).reshape(3)
+    if not np.isfinite(t).all():
+        return None
+    return t
 
 
 def denorm_image(img_chw: torch.Tensor) -> np.ndarray:
@@ -302,8 +374,18 @@ def overlay_mesh_on_image(
         raise ValueError(f"alpha must be in [0,1], got {alpha}")
 
     h, w, _ = img_hwc_01.shape
-    uv = project_points(verts_cam, cam_param[:4])  # (V,2)
-    z = verts_cam[:, 2].astype(np.float32)  # (V,)
+
+    z_raw = np.asarray(verts_cam[:, 2], dtype=np.float32)
+    finite = np.isfinite(z_raw)
+    nonzero = finite & (np.abs(z_raw) > 1e-8)
+    if np.any(nonzero):
+        depth_sign = 1.0 if float(np.median(z_raw[nonzero])) >= 0.0 else -1.0
+    else:
+        depth_sign = 1.0
+    verts_proj = np.asarray(verts_cam, dtype=np.float32) * depth_sign
+
+    uv = project_points(verts_proj, cam_param[:4])  # (V,2)
+    z = verts_proj[:, 2].astype(np.float32)  # (V,)
 
     rgb = np.asarray(to_rgb(color), dtype=np.float32)  # (3,)
     zbuf = np.full((h, w), np.inf, dtype=np.float32)
@@ -359,9 +441,9 @@ def overlay_mesh_on_image(
             continue
 
         # Simple shading for depth cues (robust to winding by using abs(n_z)).
-        v0 = verts_cam[f0]
-        v1 = verts_cam[f1]
-        v2 = verts_cam[f2]
+        v0 = verts_proj[f0]
+        v1 = verts_proj[f1]
+        v2 = verts_proj[f2]
         n = np.cross(v1 - v0, v2 - v0).astype(np.float32)
         n_norm = float(np.linalg.norm(n) + 1e-12)
         n = n / n_norm
@@ -424,6 +506,18 @@ def main() -> None:
             "Which camera center (cx,cy) to use for projection/overlay. "
             "'cam_param' uses (cx,cy) from dataloader cam_param. "
             "'patch' forces (cx,cy) to patch center (W/2,H/2) for debugging translation/center mismatch."
+        ),
+    )
+    parser.add_argument(
+        "--projection-mode",
+        type=str,
+        default="auto",
+        choices=("auto", "pred_cam_t", "fit_gt_2d"),
+        help=(
+            "How to place predicted local MANO joints/mesh onto the 2D image plane. "
+            "'pred_cam_t' uses the model weak-perspective translation directly. "
+            "'fit_gt_2d' solves a perspective translation from predicted local 3D joints to GT 2D joints. "
+            "'auto' keeps FreiHAND on pred_cam_t and uses fit_gt_2d for Dex-YCB/HO3D when GT 2D is available."
         ),
     )
     parser.add_argument("--save-mesh-obj", action="store_true", help="Save predicted mesh as .obj alongside images.")
@@ -519,6 +613,7 @@ def main() -> None:
     faces_np = get_mano_faces_np(model)
 
     dataset = build_dataset(cfg_data)
+    dataset_name = str(cfg_data.get("dataset", {}).get("name", "")).lower()
     n_total = len(dataset)
     n_vis = min(int(args.num_samples), n_total)
     if n_vis <= 0:
@@ -558,6 +653,24 @@ def main() -> None:
         xf = float(x)
         return xf if np.isfinite(xf) else None
 
+    def _abs_frame_compatible(pred_j_abs: np.ndarray, gt_j_abs: np.ndarray, root_idx: int) -> bool:
+        if pred_j_abs.ndim != 2 or gt_j_abs.ndim != 2:
+            return False
+        if root_idx < 0 or root_idx >= pred_j_abs.shape[0] or root_idx >= gt_j_abs.shape[0]:
+            return False
+        pred_root = np.asarray(pred_j_abs[root_idx], dtype=np.float32)
+        gt_root = np.asarray(gt_j_abs[root_idx], dtype=np.float32)
+        if not (np.isfinite(pred_root).all() and np.isfinite(gt_root).all()):
+            return False
+        pred_depth = float(pred_root[2])
+        gt_depth = float(gt_root[2])
+        if abs(pred_depth) < 1e-6 or abs(gt_depth) < 1e-6:
+            return False
+        if pred_depth * gt_depth <= 0.0:
+            return False
+        depth_ratio = abs(pred_depth) / max(abs(gt_depth), 1e-6)
+        return 0.25 <= depth_ratio <= 4.0
+
     def write_obj(path: Path, verts: np.ndarray, faces: np.ndarray) -> None:
         with path.open("w", encoding="utf-8") as f:
             for v in verts:
@@ -575,14 +688,12 @@ def main() -> None:
             pred_t_m = out["pred_cam_t"]  # meters
             pred_j_m = out["pred_keypoints_3d"]  # meters
             pred_v_m = out["pred_vertices"]  # meters
-            # For 2D projection / overlays we need camera-space translation.
-            pred_j_cam_m = pred_j_m + pred_t_m.unsqueeze(1)
-            pred_v_cam_m = pred_v_m + pred_t_m.unsqueeze(1)
             gt_j = batch["keypoints_3d"].to(device)  # meters
 
             bsz, _, h, w = rgb.shape
-            pred_j_np = pred_j_cam_m.detach().cpu().numpy()
-            pred_v_np = pred_v_cam_m.detach().cpu().numpy()
+            pred_t_np = pred_t_m.detach().cpu().numpy()
+            pred_j_local_np = pred_j_m.detach().cpu().numpy()
+            pred_v_local_np = pred_v_m.detach().cpu().numpy()
             pred_j_m_np = pred_j_m.detach().cpu().numpy()
             gt_j_np = gt_j.detach().cpu().numpy()
             cam_np = cam_param.detach().cpu().numpy()
@@ -599,7 +710,6 @@ def main() -> None:
                 if args.camera_center == "patch":
                     cam_for_proj[2] = float(w) * 0.5
                     cam_for_proj[3] = float(h) * 0.5
-                pred_uv = project_points(pred_j_np[bi], cam_for_proj)
                 gt_uv = np.stack(
                     [
                         (gt_uv_norm[bi, :, 0] + 0.5) * float(w),
@@ -622,13 +732,42 @@ def main() -> None:
                 if xyz_valid_t is not None:
                     has_gt_3d = bool(float(xyz_valid_t[bi].item()) > 0.5)
 
+                if args.projection_mode == "auto":
+                    proj_mode = "pred_cam_t" if dataset_name in ("freihand",) else "fit_gt_2d"
+                else:
+                    proj_mode = str(args.projection_mode)
+
+                vis_t = pred_t_np[bi].astype(np.float32, copy=True)
+                if proj_mode == "fit_gt_2d" and has_gt_2d:
+                    fit_t = solve_translation_from_2d_correspondences(
+                        points_3d=pred_j_local_np[bi],
+                        points_2d=gt_uv,
+                        cam_param=cam_for_proj,
+                        valid=m2d.astype(np.float32),
+                    )
+                    if fit_t is not None:
+                        vis_t = fit_t
+                    else:
+                        proj_mode = "pred_cam_t"
+                elif proj_mode == "fit_gt_2d":
+                    proj_mode = "pred_cam_t"
+
+                pred_j_vis = pred_j_local_np[bi] + vis_t[None, :]
+                pred_v_vis = pred_v_local_np[bi] + vis_t[None, :]
+                pred_uv = project_points(pred_j_vis, cam_for_proj)
+
+                raw_pred_j_vis = pred_j_local_np[bi] + pred_t_np[bi][None, :]
+                raw_pred_uv = project_points(raw_pred_j_vis, cam_for_proj)
+
                 pred_j_root = pred_j_m_np[bi] - pred_j_m_np[bi, ri : ri + 1]
-                pred_v_root = pred_v_np[bi] - pred_j_np[bi, ri : ri + 1]
+                pred_v_root = pred_v_local_np[bi] - pred_j_m_np[bi, ri : ri + 1]
                 gt_j_root = gt_j_np[bi] - gt_j_np[bi, ri : ri + 1] if has_gt_3d else None
 
                 err_2d_px = float("nan")
+                raw_err_2d_px = float("nan")
                 if has_gt_2d:
                     err_2d_px = float(np.linalg.norm(pred_uv[m2d] - gt_uv[m2d], axis=-1).mean())
+                    raw_err_2d_px = float(np.linalg.norm(raw_pred_uv[m2d] - gt_uv[m2d], axis=-1).mean())
 
                 # Dataset/camera consistency check: GT 3D joints should reproject to GT 2D joints.
                 # This uses the original cam_param from the dataloader (regardless of --camera-center).
@@ -640,6 +779,9 @@ def main() -> None:
                 err_3d_mm = float("nan")
                 err_pa_3d_mm = float("nan")
                 err_abs_3d_mm = float("nan")
+                abs_frame_ok = False
+                pred_root_depth_m = float("nan")
+                gt_root_depth_m = float("nan")
                 if has_gt_3d and gt_j_root is not None:
                     # Match training/eval definition:
                     # - use out["pred_keypoints_3d"] (no pred_cam_t)
@@ -648,8 +790,14 @@ def main() -> None:
                     err_pa_3d_mm = float(
                         compute_pa_mpjpe(torch.from_numpy(pred_j_root), torch.from_numpy(gt_j_root)) * 1000.0
                     )
-                    # Absolute MPJPE in camera space (no root-centering): includes the effect of translation.
-                    err_abs_3d_mm = float(np.linalg.norm(pred_j_np[bi] - gt_j_np[bi], axis=-1).mean() * 1000.0)
+                    pred_root_depth_m = float(pred_j_m_np[bi, ri, 2])
+                    gt_root_depth_m = float(gt_j_np[bi, ri, 2])
+                    # Absolute MPJPE is only meaningful when prediction/GT share a compatible
+                    # absolute 3D frame. `pred_cam_t` is used for 2D projection but is not a
+                    # calibrated metric translation for this model.
+                    abs_frame_ok = _abs_frame_compatible(pred_j_m_np[bi], gt_j_np[bi], ri)
+                    if abs_frame_ok:
+                        err_abs_3d_mm = float(np.linalg.norm(pred_j_m_np[bi] - gt_j_np[bi], axis=-1).mean() * 1000.0)
 
                 sample_idx = subset_indices[global_i]
                 img_path = None
@@ -670,15 +818,22 @@ def main() -> None:
                         "has_gt_2d": bool(has_gt_2d),
                         "has_gt_3d": bool(has_gt_3d),
                         "mean_2d_error_px": _json_safe_number(err_2d_px),
+                        "raw_2d_error_px": _json_safe_number(raw_err_2d_px),
                         "gt_2d_reproj_error_px": _json_safe_number(gt_reproj_err_2d_px),
                         "cam_center_offset_px": [
                             _json_safe_number(float(cam_np[bi][2] - float(w) * 0.5)),
                             _json_safe_number(float(cam_np[bi][3] - float(h) * 0.5)),
                         ],
+                        "projection_mode_used": str(proj_mode),
+                        "vis_cam_translation_m": [_json_safe_number(float(x)) for x in vis_t],
+                        "pred_cam_t_m": [_json_safe_number(float(x)) for x in pred_t_np[bi]],
                         "num_uv_valid": int(m2d.sum()),
                         "mpjpe_mm": _json_safe_number(err_3d_mm),
                         "pa_mpjpe_mm": _json_safe_number(err_pa_3d_mm),
                         "abs_mpjpe_mm": _json_safe_number(err_abs_3d_mm),
+                        "abs_frame_compatible": bool(abs_frame_ok),
+                        "pred_root_depth_m": _json_safe_number(pred_root_depth_m),
+                        "gt_root_depth_m": _json_safe_number(gt_root_depth_m),
                         "root_index": int(root_index),
                     }
                 )
@@ -686,7 +841,7 @@ def main() -> None:
                 if args.save_mesh_obj:
                     obj_name = f"sample_{global_i:03d}_idx_{sample_idx}.obj"
                     try:
-                        write_obj(out_dir / obj_name, pred_v_np[bi], faces_np)
+                        write_obj(out_dir / obj_name, pred_v_vis, faces_np)
                     except OSError as e:
                         if not is_write_space_error(e):
                             raise
@@ -704,7 +859,7 @@ def main() -> None:
                                 f"Saving remaining outputs to fallback dir: {fallback}"
                             )
                             out_dir = fallback
-                        write_obj(out_dir / obj_name, pred_v_np[bi], faces_np)
+                        write_obj(out_dir / obj_name, pred_v_vis, faces_np)
 
                 if not args.no_save_images:
                     fig = plt.figure(figsize=(12, 4))
@@ -714,7 +869,7 @@ def main() -> None:
                         if args.overlay_mesh:
                             img_vis = overlay_mesh_on_image(
                                 img_hwc_01=img_np,
-                                verts_cam=pred_v_np[bi],
+                                verts_cam=pred_v_vis,
                                 faces=faces_np,
                                 cam_param=cam_for_proj,
                                 color=str(args.overlay_mesh_color),
@@ -724,7 +879,10 @@ def main() -> None:
                         if has_gt_2d:
                             draw_skeleton_2d(ax1, gt_uv, color="#22c55e", alpha=0.9, valid=m2d.astype(np.float32))
                         draw_skeleton_2d(ax1, pred_uv, color="#ef4444", alpha=0.8)
-                        ax1.set_title(f"idx={sample_idx} | 2D err={_fmt_or_na(err_2d_px)}px")
+                        title_2d = f"idx={sample_idx} | 2D err={_fmt_or_na(err_2d_px)}px"
+                        if has_gt_2d and proj_mode != "pred_cam_t":
+                            title_2d += f" | raw={_fmt_or_na(raw_err_2d_px)}px"
+                        ax1.set_title(title_2d)
                         ax1.set_xlim([0, w])
                         ax1.set_ylim([h, 0])
                         ax1.set_aspect("equal")
@@ -795,6 +953,7 @@ def main() -> None:
                 global_i += 1
 
     mean_2d_vals = [float(m["mean_2d_error_px"]) for m in metrics if _is_finite_number(m["mean_2d_error_px"])]
+    mean_raw_2d_vals = [float(m["raw_2d_error_px"]) for m in metrics if _is_finite_number(m.get("raw_2d_error_px"))]
     mean_gt_reproj_2d_vals = [
         float(m["gt_2d_reproj_error_px"]) for m in metrics if _is_finite_number(m.get("gt_2d_reproj_error_px"))
     ]
@@ -802,20 +961,25 @@ def main() -> None:
     mean_pa_3d_vals = [float(m["pa_mpjpe_mm"]) for m in metrics if _is_finite_number(m["pa_mpjpe_mm"])]
     mean_abs_3d_vals = [float(m["abs_mpjpe_mm"]) for m in metrics if _is_finite_number(m["abs_mpjpe_mm"])]
     mean_2d = float(np.mean(mean_2d_vals)) if mean_2d_vals else float("nan")
+    mean_raw_2d = float(np.mean(mean_raw_2d_vals)) if mean_raw_2d_vals else float("nan")
     mean_gt_reproj_2d = float(np.mean(mean_gt_reproj_2d_vals)) if mean_gt_reproj_2d_vals else float("nan")
     mean_3d = float(np.mean(mean_3d_vals)) if mean_3d_vals else float("nan")
     mean_pa_3d = float(np.mean(mean_pa_3d_vals)) if mean_pa_3d_vals else float("nan")
     mean_abs_3d = float(np.mean(mean_abs_3d_vals)) if mean_abs_3d_vals else float("nan")
+    abs_valid_count = len(mean_abs_3d_vals)
     summary = {
         "checkpoint": args.ckpt,
         "num_samples": len(metrics),
         "mean_2d_error_px": _json_safe_number(mean_2d),
+        "mean_raw_2d_error_px": _json_safe_number(mean_raw_2d),
         "mean_2d_reproj_error_px": _json_safe_number(mean_gt_reproj_2d),
         "mean_mpjpe_mm": _json_safe_number(mean_3d),
         "mean_pa_mpjpe_mm": _json_safe_number(mean_pa_3d),
         "mean_abs_mpjpe_mm": _json_safe_number(mean_abs_3d),
+        "num_abs_mpjpe_valid": int(abs_valid_count),
         "root_index": int(root_index),
         "camera_center_mode": str(args.camera_center),
+        "projection_mode": str(args.projection_mode),
         "samples": metrics,
     }
     summary_path = out_dir / "summary.json"
@@ -844,10 +1008,27 @@ def main() -> None:
         print(f"Saved {len(metrics)} visualization images to: {out_dir}")
     # print(f"Mean 2D error: {mean_2d:.3f}px")
     print(f"Mean pred 2D error (px): {mean_2d:.3f}px")
+    if mean_raw_2d_vals:
+        print(f"Mean raw pred_cam_t 2D error (px): {mean_raw_2d:.3f}px")
     print(f"Mean GT 2D reprojection error (px): {mean_gt_reproj_2d:.3f}px")
     print(f"Mean MPJPE: {mean_3d:.3f}mm (root_index={root_index})")
     print(f"Mean PA-MPJPE: {mean_pa_3d:.3f}mm (root_index={root_index})")
-    print("Mean abs MPJPE: {:.3f}mm (no root-center; uses pred_cam_t for camera-space joints)".format(mean_abs_3d))
+    abs_valid_count = len(mean_abs_3d_vals)
+    if abs_valid_count == len(metrics) and abs_valid_count > 0:
+        print("Mean abs MPJPE: {:.3f}mm (absolute 3D frame compatible on all samples)".format(mean_abs_3d))
+    elif abs_valid_count > 0:
+        print(
+            "Mean abs MPJPE: {:.3f}mm (computed on {}/{} samples with compatible absolute 3D frames)".format(
+                mean_abs_3d,
+                abs_valid_count,
+                len(metrics),
+            )
+        )
+    else:
+        print(
+            "Mean abs MPJPE: N/A (predicted and GT joints are not in a compatible absolute 3D frame; "
+            "`pred_cam_t` is only used for 2D projection)"
+        )
     print(f"Summary: {summary_path}")
 
 

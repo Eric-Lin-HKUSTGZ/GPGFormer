@@ -354,7 +354,7 @@ class DexYCBDataset(Dataset):
 
         coord_valid = (uv_norm > 0).astype("float32") * (uv_norm < 1).astype("float32")
         coord_valid = coord_valid[:, 0] * coord_valid[:, 1]
-
+       
         valid_points = [keypoints_2d[i] for i in range(len(keypoints_2d)) if coord_valid[i] == 1]
         if len(valid_points) >= 2:
             points = np.array(valid_points)

@@ -119,6 +119,46 @@ Eval:
 python eval.py --config configs/config_ho3d.yaml --ckpt checkpoints/ho3d/gpgformer_epoch_1.pt
 ```
 
+### Infer + full metrics (指定配置与权重路径)
+
+运行 `infer_to_json.py`（现已支持 `freihand` / `ho3d` / `dexycb`，输出 MPJPE / PA-MPJPE / MPVPE / PA-MPVPE / F-score@5mm,15mm / AUC-J / AUC-V）：
+
+说明：
+- `infer_to_json.py` 已强制使用 **detector-only hand crop**（不会使用标签框裁剪；会忽略配置里的 `dataset.bbox_source_eval`）。
+- 需要可用的 `paths.detector_ckpt`（如 `/root/code/vepfs/GPGFormer/weights/detector.pt`）和 `ultralytics` 依赖。
+- 若某张图 detector 未检出有效手框，该样本会被自动跳过（不会回退到 GT bbox），并记录到输出 JSON 的 `skipped_samples` 中（含索引、图片路径、原因）。
+- MPJPE/PA-MPJPE/MPVPE/PA-MPVPE 使用与 `train.py`/`eval.py` 一致的 **root-relative** 评测口径（`root_index` 默认 9）。
+- FreiHAND 的 mesh 指标优先使用 `training_verts.json` 的真实顶点；只有在缺少 `vertices_gt` 时才会回退到 MANO 参数重建。
+- 对 MANO 回退得到的 mesh 会做与关节 GT 的一致性校验（默认阈值 `metrics.mesh_fallback_kp_consistency_thr_mm=10`），不一致样本会从 mesh 指标剔除并记录到 JSON 的 `mesh_invalid_samples`。
+
+```bash
+# FreiHAND
+python /root/code/hand_reconstruction/GPGFormer/infer_to_json.py \
+  --config /root/code/hand_reconstruction/GPGFormer/configs/config_freihand_loss.yaml \
+  --ckpt /root/code/vepfs/GPGFormer/checkpoints/freihand_20260306_loss/freihand/gpgformer_best.pt \
+  --output /root/code/vepfs/GPGFormer/outputs/freihand_20260311/metrics_infer_to_json.json
+
+
+
+
+# HO3D
+python /root/code/hand_reconstruction/GPGFormer/infer_to_json.py \
+  --config /root/code/hand_reconstruction/GPGFormer/configs/ablations/config_ho3d_multimodal_mask_consistency.yaml \
+  --ckpt /root/code/vepfs/GPGFormer/checkpoints/ablations/ho3d_multimodal_mask_consistency_20260310/ho3d/gpgformer_best.pt \
+  --output /root/code/vepfs/GPGFormer/outputs/ho3d_multimodal_mask_consistency_20260310/metrics_infer_to_json.json
+
+python /root/code/hand_reconstruction/GPGFormer/infer_to_json.py \
+  --config /root/code/hand_reconstruction/GPGFormer/configs/config_ho3d_loss.yaml \
+  --ckpt /root/code/vepfs/GPGFormer/checkpoints/ablations/ho3d_20260307/ho3d/gpgformer_best.pt \
+  --output /root/code/vepfs/GPGFormer/outputs/ho3d_20260307/metrics_infer_to_json.json
+
+# Dex-YCB
+python /root/code/hand_reconstruction/GPGFormer/infer_to_json.py \
+  --config /root/code/hand_reconstruction/GPGFormer/configs/config_dexycb.yaml \
+  --ckpt /root/code/vepfs/GPGFormer/checkpoints/dexycb_20260305/dexycb/gpgformer_best.pt \
+  --output /root/code/vepfs/GPGFormer/outputs/dexycb_20260305/metrics_infer_to_json.json
+```
+
 ### Hand reconstruction visualization
 
 Run visualization with a checkpoint (if checkpoint contains `cfg`, you can omit `--config`):
@@ -137,9 +177,27 @@ For your provided checkpoint:
 
 ```bash
 python visualize_reconstruction.py \
-  --ckpt /root/code/vepfs/GPGFormer/checkpoints/ho3d_20260224_neck_moge_400/ho3d/gpgformer_best.pt \
-  --config configs/config_ho3d.yaml \
-  --out-dir outputs/ho3d_20260224 \
+  --ckpt /root/code/vepfs/GPGFormer/checkpoints/dexycb_20260305/dexycb/gpgformer_best.pt \
+  --config configs/config_dexycb2.yaml \
+  --out-dir outputs/dexycb_20260305 \
+  --overlay-mesh \
+  --render-mesh \
+  --num-samples 24 \
+  --batch-size 8
+
+python visualize_reconstruction.py \
+  --ckpt /root/code/vepfs/GPGFormer/checkpoints/ablations/ho3d_multimodal_mask_consistency_20260310/ho3d/gpgformer_best.pt \
+  --config configs/ablations/config_ho3d_multimodal_mask_consistency.yaml \
+  --out-dir outputs/ho3d_20260310 \
+  --overlay-mesh \
+  --render-mesh \
+  --num-samples 40 \
+  --batch-size 8
+
+python visualize_reconstruction.py \
+  --ckpt /root/code/vepfs/GPGFormer/checkpoints/freihand_multimodal_mask_consistency_meshlight_20260311/freihand/gpgformer_best.pt \
+  --config configs/config_freihand_multimodal_mask_consistency_meshlight.yaml \
+  --out-dir outputs/freihand_20260311 \
   --overlay-mesh \
   --render-mesh \
   --num-samples 24 \

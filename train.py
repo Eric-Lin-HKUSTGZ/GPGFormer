@@ -175,8 +175,8 @@ def build_dataset(cfg: dict, split: str):
         #     trainval_seed=int(cfg["dataset"].get("trainval_seed", 42)),
         #     use_trainval_split=bool(cfg["dataset"].get("use_trainval_split", True)),
         # )
-        from data.freihand_dataset_v2 import FreiHANDDatasetV2
-        return FreiHANDDatasetV2(
+        from data.freihand_dataset_v3 import FreiHANDDatasetV3
+        return FreiHANDDatasetV3(
             root_dir=cfg["paths"]["freihand_root"],
             eval_root=cfg["paths"].get("freihand_eval_root", None),
             img_size=int(cfg["dataset"].get("img_size", 256)),
@@ -212,6 +212,101 @@ def mano_from_gt(batch: Dict[str, torch.Tensor], device: torch.device):
     return mano_params, mano_trans_m
 
 
+def _build_gt_vertices_from_batch(
+    model: torch.nn.Module,
+    batch: Dict[str, torch.Tensor],
+    device: torch.device,
+    dtype: torch.dtype,
+):
+    model_core = model.module if isinstance(model, DDP) else model
+    decoder_name = str(getattr(model_core, "mano_decoder", "wilor")).lower()
+
+    gt_v_src = batch.get("vertices_gt", None)
+    if gt_v_src is not None:
+        gt_v_m = (
+            gt_v_src.to(device=device, dtype=dtype)
+            if isinstance(gt_v_src, torch.Tensor)
+            else torch.as_tensor(gt_v_src, device=device, dtype=dtype)
+        )
+        if gt_v_m.dim() == 2:
+            gt_v_m = gt_v_m.unsqueeze(0)
+        if gt_v_m.ndim != 3 or gt_v_m.shape[-1] != 3:
+            raise ValueError(f"Invalid vertices_gt shape: {tuple(gt_v_m.shape)}")
+        return gt_v_m
+
+    has_mano_params = batch.get("has_mano_params", None)
+    if isinstance(has_mano_params, dict):
+        valid_flags = []
+        for key in ("global_orient", "hand_pose", "betas"):
+            v = has_mano_params.get(key, None)
+            if v is None:
+                return None
+            vt = v.to(device) if isinstance(v, torch.Tensor) else torch.as_tensor(v, device=device)
+            valid_flags.append(vt.reshape(-1) > 0.5)
+        valid_mano_mask = valid_flags[0]
+        for vf in valid_flags[1:]:
+            valid_mano_mask = valid_mano_mask & vf
+        if not bool(valid_mano_mask.any()):
+            return None
+
+    gt_pose_aa = batch.get("mano_pose", None)
+    gt_betas = batch.get("mano_shape", None)
+    if gt_pose_aa is not None and gt_betas is not None:
+        gt_pose_aa = gt_pose_aa.to(device)
+        gt_betas = gt_betas.to(device)
+    else:
+        mano_params = batch.get("mano_params", None)
+        if not isinstance(mano_params, dict):
+            return None
+        go = mano_params.get("global_orient", None)
+        hp = mano_params.get("hand_pose", None)
+        bt = mano_params.get("betas", None)
+        if go is None or hp is None or bt is None:
+            return None
+        go = torch.as_tensor(go, device=device)
+        hp = torch.as_tensor(hp, device=device)
+        bt = torch.as_tensor(bt, device=device)
+        if go.dim() == 1:
+            go = go.unsqueeze(0)
+        if hp.dim() == 1:
+            hp = hp.unsqueeze(0)
+        if bt.dim() == 1:
+            bt = bt.unsqueeze(0)
+        gt_pose_aa = torch.cat([go, hp], dim=-1)
+        gt_betas = bt
+
+    Bm = int(gt_pose_aa.shape[0])
+    if decoder_name == "freihand_legacy":
+        model_core._init_freihand_mano_layer(device=device, dtype=dtype)
+        trans0 = torch.zeros((Bm, 3), device=device, dtype=gt_pose_aa.dtype)
+        verts_mm, _ = model_core._freihand_mano_layer(gt_pose_aa.reshape(Bm, 48), gt_betas, trans0)
+        return verts_mm.to(device=device, dtype=dtype) / 1000.0
+
+    pose_rm = aa_to_rotmat(gt_pose_aa.reshape(Bm, 16, 3).reshape(-1, 3)).view(Bm, 16, 3, 3)
+    gt_mano_params = {
+        "global_orient": pose_rm[:, [0]],
+        "hand_pose": pose_rm[:, 1:],
+        "betas": gt_betas,
+    }
+    gt_mano_out = model_core.mano(gt_mano_params, pose2rot=False)
+    return gt_mano_out.vertices.to(device=device, dtype=dtype)
+
+
+def _kp21_from_verts_m(model: torch.nn.Module, verts_m: torch.Tensor) -> torch.Tensor:
+    model_core = model.module if isinstance(model, DDP) else model
+    decoder_name = str(getattr(model_core, "mano_decoder", "wilor")).lower()
+    if decoder_name == "freihand_legacy":
+        model_core._init_freihand_mano_layer(device=verts_m.device, dtype=verts_m.dtype)
+        J_reg = getattr(model_core._freihand_mano_layer, "th_J_regressor", None)
+        if J_reg is None:
+            raise AttributeError("freihand MANO layer missing th_J_regressor")
+        return model_core._freihand_kp21_from_verts_mm(verts_m * 1000.0, J_reg) / 1000.0
+    J_reg = getattr(model_core.mano.mano, "J_regressor", None)
+    if J_reg is None:
+        raise AttributeError("MANO layer is missing J_regressor; cannot build FreiHAND 21 keypoints.")
+    return model_core._kp21_from_verts(verts_m, J_reg)
+
+
 @torch.no_grad()
 def evaluate_epoch(
     model: torch.nn.Module,
@@ -226,7 +321,10 @@ def evaluate_epoch(
 
     mpjpe_sum = torch.zeros((), device=device, dtype=torch.float64)
     pampjpe_sum = torch.zeros((), device=device, dtype=torch.float64)
+    mpvpe_sum = torch.zeros((), device=device, dtype=torch.float64)
+    pampvpe_sum = torch.zeros((), device=device, dtype=torch.float64)
     n = torch.zeros((), device=device, dtype=torch.float64)
+    n_vert = torch.zeros((), device=device, dtype=torch.float64)
 
     it = tqdm(loader, desc="val", disable=(not is_main_process()))
     warned_degenerate_gt = False
@@ -236,17 +334,14 @@ def evaluate_epoch(
         cam_param = cam_param.to(device) if cam_param is not None else None
 
         out = model(img, cam_param=cam_param)
-        pred_t_m = out["pred_cam_t"]  # meters
-        # Use meters end-to-end; convert to mm only for metric outputs.
-        pred_j_m = out["pred_keypoints_3d"]
+        pred_j_all_m = out["pred_keypoints_3d"]
 
-        
-        gt_j_m = batch.get("keypoints_3d", None)
-        gt_j_m = gt_j_m.to(device)
+        gt_j_all_m = batch.get("keypoints_3d", None)
+        gt_j_all_m = gt_j_all_m.to(device)
 
         # Filter invalid/degenerate GT (e.g. HO3D evaluation split may only have root joint tiled to 21 joints).
-        gt_var = gt_j_m.var(dim=(1, 2))
-        finite_mask = torch.isfinite(gt_j_m).all(dim=(1, 2))
+        gt_var = gt_j_all_m.var(dim=(1, 2))
+        finite_mask = torch.isfinite(gt_j_all_m).all(dim=(1, 2))
         valid_mask = (gt_var > 1e-8) & finite_mask
         if not bool(valid_mask.any()):
             if (not warned_degenerate_gt) and is_main_process():
@@ -254,8 +349,8 @@ def evaluate_epoch(
                 warned_degenerate_gt = True
             continue
 
-        pred_j_m = pred_j_m[valid_mask]
-        gt_j_m = gt_j_m[valid_mask]
+        pred_j_m = pred_j_all_m[valid_mask]
+        gt_j_m = gt_j_all_m[valid_mask]
 
         # Root-center both pred/gt with the same root index before MPJPE/PA-MPJPE.
         ri = int(root_index)
@@ -269,6 +364,27 @@ def evaluate_epoch(
         pampjpe_sum += pamp.double().sum()
         n += float(pred_j_m.shape[0])
 
+        pred_v_all_m = out.get("pred_vertices", None)
+        gt_v_all_m = _build_gt_vertices_from_batch(model, batch, device=device, dtype=pred_j_all_m.dtype)
+        if pred_v_all_m is not None and gt_v_all_m is not None:
+            finite_vert_mask = torch.isfinite(gt_v_all_m).all(dim=(1, 2)) & torch.isfinite(pred_v_all_m).all(dim=(1, 2))
+            valid_vert_mask = valid_mask & finite_vert_mask
+            if bool(valid_vert_mask.any()):
+                pred_v_m = pred_v_all_m[valid_vert_mask]
+                gt_v_m = gt_v_all_m[valid_vert_mask]
+                pred_v_root = pred_j_all_m[valid_vert_mask, ri]
+                gt_v_root = _kp21_from_verts_m(model, gt_v_m)[:, ri]
+
+                pred_v_m = pred_v_m - pred_v_root[:, None, :]
+                gt_v_m = gt_v_m - gt_v_root[:, None, :]
+
+                mpvpe = (pred_v_m - gt_v_m).norm(dim=-1).mean(dim=-1)  # (B_valid_vert,) meters
+                pampv = torch.from_numpy(compute_pa_mpjpe(pred_v_m, gt_v_m)).to(device=device)  # (B_valid_vert,) meters
+
+                mpvpe_sum += mpvpe.double().sum()
+                pampvpe_sum += pampv.double().sum()
+                n_vert += float(pred_v_m.shape[0])
+
         if is_main_process():
             denom = float(max(float(n.item()), 1.0))
             it.set_postfix(mpjpe=f"{float(mpjpe_sum.item())/denom:.2f}", pamp=f"{float(pampjpe_sum.item())/denom:.2f}")
@@ -276,15 +392,34 @@ def evaluate_epoch(
     if distributed:
         all_reduce_sum(mpjpe_sum)
         all_reduce_sum(pampjpe_sum)
+        all_reduce_sum(mpvpe_sum)
+        all_reduce_sum(pampvpe_sum)
         all_reduce_sum(n)
+        all_reduce_sum(n_vert)
 
     n_val = float(n.item())
     if n_val <= 0:
-        return float("nan"), float("nan")
+        return {
+            "MPJPE_mm": float("nan"),
+            "PA-MPJPE_mm": float("nan"),
+            "MPVPE_mm": float("nan"),
+            "PA-MPVPE_mm": float("nan"),
+        }
     mpjpe_m = float(mpjpe_sum.item()) / n_val
     pampjpe_m = float(pampjpe_sum.item()) / n_val
-    # Convert metrics to mm for logging/output
-    return mpjpe_m * 1000.0, pampjpe_m * 1000.0
+    n_vert_val = float(n_vert.item())
+    if n_vert_val > 0:
+        mpvpe_m = float(mpvpe_sum.item()) / n_vert_val
+        pampvpe_m = float(pampvpe_sum.item()) / n_vert_val
+    else:
+        mpvpe_m = float("nan")
+        pampvpe_m = float("nan")
+    return {
+        "MPJPE_mm": mpjpe_m * 1000.0,
+        "PA-MPJPE_mm": pampjpe_m * 1000.0,
+        "MPVPE_mm": mpvpe_m * 1000.0 if math.isfinite(mpvpe_m) else float("nan"),
+        "PA-MPVPE_mm": pampvpe_m * 1000.0 if math.isfinite(pampvpe_m) else float("nan"),
+    }
 
 
 def main():
@@ -390,11 +525,14 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
     moge2_num_tokens = int(cfg.get("model", {}).get("moge2_num_tokens", 400))
 
     # Model
+    backbone_type = str(cfg["model"].get("backbone_type", "wilor"))
     if is_main_process():
-        print("[progress] Creating model (loading WiLoR + MoGe2 weights) ...", flush=True)
+        print(f"[progress] Creating model (loading {backbone_type.upper()} + MoGe2 weights) ...", flush=True)
     model: torch.nn.Module = GPGFormer(
         GPGFormerConfig(
-            wilor_ckpt_path=cfg["paths"]["wilor_ckpt"],
+            backbone_type=str(cfg["model"].get("backbone_type", "wilor")),
+            wilor_ckpt_path=cfg["paths"].get("wilor_ckpt", ""),
+            vitpose_ckpt_path=cfg["paths"].get("vitpose_ckpt", ""),
             moge2_weights_path=cfg["paths"].get("moge2_ckpt", None),
             use_geo_prior=bool(cfg["model"].get("use_geo_prior", True)),
             mano_model_path=cfg["paths"]["mano_dir"],
@@ -418,6 +556,7 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
             # Token fusion mode: concat or sum
             token_fusion_mode=str(cfg["model"].get("token_fusion_mode", "concat")),
             sum_fusion_strategy=str(cfg["model"].get("sum_fusion_strategy", "basic")),
+            sum_geo_gate_init=float(cfg["model"].get("sum_geo_gate_init", 4.0)),
             fusion_proj_zero_init=bool(cfg["model"].get("fusion_proj_zero_init", True)),
             cross_attn_num_heads=int(cfg["model"].get("cross_attn_num_heads", 8)),
             cross_attn_dropout=float(cfg["model"].get("cross_attn_dropout", 0.0)),
@@ -428,6 +567,7 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
             geo_side_tuning_dropout=float(cfg["model"].get("side_tuning", {}).get("dropout", 0.1)),
             geo_side_tuning_max_res_scale=float(cfg["model"].get("side_tuning", {}).get("max_res_scale", 0.1)),
             geo_side_tuning_init_res_scale=float(cfg["model"].get("side_tuning", {}).get("init_res_scale", 1e-3)),
+            geo_branch_dropout_prob=float(cfg["model"].get("geo_branch_dropout_prob", 0.0)),
             # Feature Refiner configuration
             feature_refiner_method=str(cfg["model"].get("feature_refiner", {}).get("method", "none")),
             feature_refiner_feat_dim=int(cfg["model"].get("feature_refiner", {}).get("feat_dim", 1280)),
@@ -490,12 +630,17 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
         w_3d_vert=float(loss_cfg.get("w_3d_vert", 0.0)),
         w_global_orient=float(loss_cfg.get("w_global_orient", 10.0)),
         w_hand_pose=float(loss_cfg.get("w_hand_pose", 10.0)),
+        # # Shape regularization on predicted MANO betas (L2 norm).
+        w_shape=float(loss_cfg.get("w_shape", 0.0)),
         root_index=root_index,
         # Optional stabilizers (off by default in existing configs)
         w_root_abs=float(loss_cfg.get("w_root_abs", 0.0)),
         w_mano_trans=float(loss_cfg.get("w_mano_trans", 0.0)),
         w_scale=float(loss_cfg.get("w_scale", 0.0)),
         w_betas=float(loss_cfg.get("w_betas", 0.0)),
+        mano_param_loss_type=str(loss_cfg.get("mano_param_loss_type", "smooth_l1")),
+        mano_param_smooth_l1_beta=float(loss_cfg.get("mano_param_smooth_l1_beta", 0.05)),
+        mano_param_per_sample_clip=float(loss_cfg.get("mano_param_per_sample_clip", 0.25)),
         reduction=str(loss_cfg.get("reduction", "mean")),
     ).to(device)
 
@@ -516,6 +661,7 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
         "geo_pos.",
         "encoder.type_embed.",
         "encoder.fusion_weight",
+        "encoder.sum_geo_gate",
         "encoder.patch_norm.",
         "encoder.geo_norm.",
         "encoder.fusion_proj.",
@@ -693,10 +839,95 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
             print(f"[info] EMA enabled with decay={ema_decay}")
 
     best_pampjpe_mm = float("inf")
+    best_pampvpe_mm = float("inf")
+    best_ckpt_score = float("inf")
+    best_ckpt_metric = str(cfg.get("train", {}).get("best_ckpt_metric", "pa_mpjpe")).strip().lower()
+    best_ckpt_joint_mesh_weight = float(cfg.get("train", {}).get("best_ckpt_joint_mesh_weight", 1.0))
+    valid_best_ckpt_metrics = {"pa_mpjpe", "joint_mesh"}
+    if best_ckpt_metric not in valid_best_ckpt_metrics:
+        raise ValueError(
+            f"Unsupported train.best_ckpt_metric={best_ckpt_metric!r}; expected one of {sorted(valid_best_ckpt_metrics)}"
+        )
+
+    def _as_bool(v, default: bool = False) -> bool:
+        if v is None:
+            return default
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return bool(v)
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s in ("1", "true", "yes", "y", "on"):
+                return True
+            if s in ("0", "false", "no", "n", "off", ""):
+                return False
+        return bool(v)
+
+    def _linear_by_epoch(epoch_idx: int, start: float, end: float, ramp_epochs: int) -> float:
+        if ramp_epochs <= 0:
+            return float(end)
+        if ramp_epochs == 1:
+            return float(end if epoch_idx >= 1 else start)
+        progress = min(max(float(epoch_idx - 1) / float(ramp_epochs - 1), 0.0), 1.0)
+        return float(start + (end - start) * progress)
+
+    # Optional masked multimodal training:
+    # - Mask RGB tokens (simulated occlusion)
+    # - Add consistency loss between clean and masked predictions
+    mask_cfg = cfg.get("train", {}).get("rgb_token_mask", {})
+    mask_enabled = _as_bool(mask_cfg.get("enabled", False), default=False)
+    mask_apply_prob = float(mask_cfg.get("apply_prob", 0.5))
+    mask_apply_prob = min(max(mask_apply_prob, 0.0), 1.0)
+    mask_apply_to_main = _as_bool(mask_cfg.get("apply_to_main_forward", False), default=False)
+    mask_ratio_start = float(mask_cfg.get("ratio_start", 0.0))
+    mask_ratio_end = float(mask_cfg.get("ratio_end", 0.3))
+    mask_ratio_start = min(max(mask_ratio_start, 0.0), 1.0)
+    mask_ratio_end = min(max(mask_ratio_end, 0.0), 1.0)
+    mask_ramp_epochs = int(mask_cfg.get("ramp_epochs", 20))
+    mask_mode = str(mask_cfg.get("mode", "block"))
+    mask_fill = str(mask_cfg.get("fill", "zero"))
+
+    cons_cfg = cfg.get("train", {}).get("consistency", {})
+    cons_enabled = _as_bool(cons_cfg.get("enabled", False), default=False)
+    cons_w_3d = float(cons_cfg.get("w_3d", 0.0))
+    cons_w_mesh = float(cons_cfg.get("w_mesh", 0.0))
+    cons_w_mesh = max(cons_w_mesh, 0.0)
+    cons_start_factor = float(cons_cfg.get("start_factor", 1.0))
+    cons_start_factor = min(max(cons_start_factor, 0.0), 1.0)
+    cons_ramp_epochs = int(cons_cfg.get("ramp_epochs", 0))
+    cons_max_samples = int(cons_cfg.get("max_samples", 0))
+    if cons_max_samples < 0:
+        cons_max_samples = 0
+    if is_main_process() and mask_enabled:
+        print(
+            f"[mask] enabled={mask_enabled} mode={mask_mode} fill={mask_fill} "
+            f"apply_prob={mask_apply_prob:.2f} apply_to_main={mask_apply_to_main} "
+            f"ratio_start={mask_ratio_start:.3f} ratio_end={mask_ratio_end:.3f} "
+            f"ramp_epochs={mask_ramp_epochs}"
+        )
+    if is_main_process() and cons_enabled and (cons_w_3d > 0 or cons_w_mesh > 0):
+        print(
+            f"[consistency] enabled={cons_enabled} w_3d={cons_w_3d:.4f} w_mesh={cons_w_mesh:.4f} "
+            f"start_factor={cons_start_factor:.3f} ramp_epochs={cons_ramp_epochs} "
+            f"max_samples={cons_max_samples}"
+        )
+    if is_main_process() and mask_apply_to_main and cons_enabled:
+        print("[warn] rgb_token_mask.apply_to_main_forward=true: consistency branch is skipped to avoid masked-vs-masked pairing.")
 
     for epoch in range(1, epochs + 1):
         if distributed and train_sampler is not None:
             train_sampler.set_epoch(epoch)
+
+        epoch_mask_ratio = _linear_by_epoch(epoch, mask_ratio_start, mask_ratio_end, mask_ramp_epochs)
+        cons_factor = _linear_by_epoch(epoch, cons_start_factor, 1.0, cons_ramp_epochs)
+        epoch_cons_w_3d = cons_w_3d * cons_factor
+        epoch_cons_w_mesh = cons_w_mesh * cons_factor
+        if is_main_process() and mask_enabled:
+            print(
+                f"[epoch {epoch}] mask ratio={epoch_mask_ratio:.3f} "
+                f"apply_prob={mask_apply_prob:.2f} cons_w_3d={epoch_cons_w_3d:.4f} cons_w_mesh={epoch_cons_w_mesh:.4f}"
+            )
 
         model.train()
         pbar = tqdm(train_loader, desc=f"train e{epoch}/{epochs}", disable=(not is_main_process()))
@@ -711,7 +942,33 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
             cam_param = batch.get("cam_param", None)
             cam_param = cam_param.to(device) if cam_param is not None else None
 
-            out = model(img, cam_param=cam_param)
+            def _sample_apply_flag(prob: float) -> bool:
+                p = float(min(max(prob, 0.0), 1.0))
+                if p <= 0.0:
+                    return False
+                if p >= 1.0:
+                    return True
+                if distributed:
+                    if dist_info.rank == 0:
+                        flag = torch.tensor([1 if float(torch.rand(1).item()) < p else 0], device=device, dtype=torch.int64)
+                    else:
+                        flag = torch.zeros((1,), device=device, dtype=torch.int64)
+                    dist.broadcast(flag, src=0)
+                    return bool(flag.item())
+                return bool(float(torch.rand(1).item()) < p)
+
+            main_apply_mask_this_batch = bool(mask_enabled and mask_apply_to_main and epoch_mask_ratio > 0.0)
+            if main_apply_mask_this_batch:
+                main_apply_mask_this_batch = _sample_apply_flag(mask_apply_prob)
+
+            out = model(
+                img,
+                cam_param=cam_param,
+                apply_rgb_token_mask=main_apply_mask_this_batch,
+                rgb_mask_ratio=epoch_mask_ratio if main_apply_mask_this_batch else 0.0,
+                rgb_mask_mode=mask_mode,
+                rgb_mask_fill=mask_fill,
+            )
 
             # Predictions in camera coordinates (meters)
             pred_t_m = out["pred_cam_t"]  # (B,3) meters
@@ -788,85 +1045,33 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
             gt_kp3d = gt_kp3d.to(device) if gt_kp3d is not None else None
             # Use meters end-to-end in training
 
-            # Optional GT vertices (meters). We supervise vertices in the same (root-relative) MANO space
-            # as the model outputs, so we do NOT apply mano_trans here.
+            # Optional GT vertices (meters). Prefer dataset-provided `vertices_gt` when available
+            # so train/eval mesh supervision uses the same source. Otherwise fall back to MANO reconstruction.
+            # We supervise vertices in the same (root-relative) MANO space as model outputs,
+            # so we do NOT apply mano_trans to vertices here.
             gt_v_m = None
             gt_root_m = None
             gt_t_m = None
             if float(loss_cfg.get("w_3d_vert", 0.0)) > 0:
-                model_core = model.module if isinstance(model, DDP) else model
+                Bm = int(img.shape[0])
+                gt_v_m = _build_gt_vertices_from_batch(model, batch, device=device, dtype=pred_v_m.dtype)
+                if gt_v_m is None:
+                    raise KeyError(
+                        "w_3d_vert>0 requires GT MANO parameters. "
+                        "Expected batch['vertices_gt'] or batch['mano_pose'/'mano_shape'] "
+                        "or batch['mano_params'] with valid has_mano_params."
+                    )
+                Bm = int(gt_v_m.shape[0])
+                gt_kp21_m = _kp21_from_verts_m(model, gt_v_m)
+                gt_root_m = gt_kp21_m[:, root_index, :]
 
-                gt_pose_aa = batch.get("mano_pose", None)
-                gt_betas = batch.get("mano_shape", None)
-                if gt_pose_aa is not None and gt_betas is not None:
-                    gt_pose_aa = gt_pose_aa.to(device)
-                    gt_betas = gt_betas.to(device)
-                else:
-                    mano_params = batch.get("mano_params", None)
-                    if not isinstance(mano_params, dict):
-                        raise KeyError(
-                            "w_3d_vert>0 requires GT MANO parameters. "
-                            "Expected batch['mano_pose'/'mano_shape'] or batch['mano_params'] dict."
-                        )
-                    go = mano_params.get("global_orient", None)
-                    hp = mano_params.get("hand_pose", None)
-                    bt = mano_params.get("betas", None)
-                    if go is None or hp is None or bt is None:
-                        raise KeyError(
-                            "batch['mano_params'] must contain keys: global_orient, hand_pose, betas "
-                            f"(got {list(mano_params.keys())})"
-                        )
-                    go = torch.as_tensor(go, device=device)
-                    hp = torch.as_tensor(hp, device=device)
-                    bt = torch.as_tensor(bt, device=device)
-                    if go.dim() == 1:
-                        go = go.unsqueeze(0)
-                    if hp.dim() == 1:
-                        hp = hp.unsqueeze(0)
-                    if bt.dim() == 1:
-                        bt = bt.unsqueeze(0)
-                    gt_pose_aa = torch.cat([go, hp], dim=-1)
-                    gt_betas = bt
-
-                Bm = int(gt_pose_aa.shape[0])
                 gt_t_m = batch.get("mano_trans", None)
                 if gt_t_m is not None:
                     gt_t_m = gt_t_m.to(device)
                     if gt_t_m.dim() == 1:
                         gt_t_m = gt_t_m.unsqueeze(0)
                 else:
-                    gt_t_m = torch.zeros((Bm, 3), device=device, dtype=gt_pose_aa.dtype)
-
-                if str(getattr(model_core, "mano_decoder", "wilor")).lower() == "freihand_legacy":
-                    model_core._init_freihand_mano_layer(device=device, dtype=img.dtype)
-                    trans0 = torch.zeros((Bm, 3), device=device, dtype=gt_pose_aa.dtype)
-                    verts_mm, _ = model_core._freihand_mano_layer(
-                        gt_pose_aa.reshape(Bm, 48), gt_betas, trans0
-                    )  # mm
-                    J_reg = getattr(model_core._freihand_mano_layer, "th_J_regressor", None)
-                    if J_reg is None:
-                        raise AttributeError("freihand MANO layer missing th_J_regressor")
-                    kp21_mm = model_core._freihand_kp21_from_verts_mm(verts_mm, J_reg)
-                    gt_v_m = verts_mm / 1000.0
-                    gt_root_m = kp21_mm[:, root_index, :] / 1000.0
-                else:
-                    pose_rm = aa_to_rotmat(gt_pose_aa.reshape(Bm, 16, 3).reshape(-1, 3)).view(Bm, 16, 3, 3)
-                    gt_mano_params = {
-                        "global_orient": pose_rm[:, [0]],
-                        "hand_pose": pose_rm[:, 1:],
-                        "betas": gt_betas,
-                    }
-                    gt_mano_out = model_core.mano(gt_mano_params, pose2rot=False)
-                    gt_v_m = gt_mano_out.vertices
-                    # Keep vertex-loss root definition consistent with prediction path:
-                    # pred root uses FreiHAND-style kp21 from verts, so GT must use the same mapping.
-                    J_reg = getattr(model_core.mano.mano, "J_regressor", None)
-                    if J_reg is None:
-                        raise AttributeError(
-                            "MANO layer is missing J_regressor; cannot build FreiHAND 21 keypoints for GT root."
-                        )
-                    gt_kp21_m = model_core._kp21_from_verts(gt_v_m, J_reg)
-                    gt_root_m = gt_kp21_m[:, root_index, :]
+                    gt_t_m = torch.zeros((Bm, 3), device=device, dtype=gt_v_m.dtype if gt_v_m is not None else pred_v_m.dtype)
 
             targets = {
                 "keypoints_2d": gt_kp2d,
@@ -924,11 +1129,12 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
 
             loss_dict = criterion(preds, targets)
             # UTNetLoss returns 'total_loss' (not 'loss')
-            loss = loss_dict.get("loss", loss_dict.get("total_loss", None))
-            if loss is None:
+            loss_main = loss_dict.get("loss", loss_dict.get("total_loss", None))
+            if loss_main is None:
                 raise KeyError(f"UTNetLoss did not return 'loss' or 'total_loss'. Keys={list(loss_dict.keys())}")
+
             # IMPORTANT: all ranks must agree to skip to avoid DDP ALLREDUCE deadlock.
-            _skip = torch.tensor([int(not torch.isfinite(loss))], device=device)
+            _skip = torch.tensor([int(not torch.isfinite(loss_main))], device=device)
             if distributed:
                 dist.all_reduce(_skip, op=dist.ReduceOp.MAX)
             if _skip.item():
@@ -938,7 +1144,74 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
                 continue
 
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+
+            # Backprop main supervised loss first to release its graph before masked consistency forward.
+            # This reduces peak memory when consistency uses an extra model forward.
+            loss_main.backward()
+            loss_for_log = loss_main.detach()
+
+            # Optional consistency loss:
+            # predict once on clean input and once on masked RGB tokens,
+            # then align root-relative 3D joints to encourage geometry usage.
+            if (
+                mask_enabled
+                and cons_enabled
+                and (not mask_apply_to_main)
+                and (epoch_cons_w_3d > 0.0 or epoch_cons_w_mesh > 0.0)
+                and epoch_mask_ratio > 0.0
+            ):
+                apply_mask_this_batch = _sample_apply_flag(mask_apply_prob)
+
+                if apply_mask_this_batch:
+                    # Memory-safe consistency: run masked forward on at most `cons_max_samples`
+                    # local samples per GPU to avoid OOM from dual full-batch forwards.
+                    img_mask = img
+                    cam_mask = cam_param
+                    pred_j_clean = out["pred_keypoints_3d"].detach()
+                    pred_v_clean = out["pred_vertices"].detach() if epoch_cons_w_mesh > 0.0 else None
+                    local_b = int(img.shape[0])
+                    if cons_max_samples > 0 and cons_max_samples < local_b:
+                        idx = torch.randperm(local_b, device=device)[:cons_max_samples]
+                        img_mask = img[idx]
+                        cam_mask = cam_param[idx] if cam_param is not None else None
+                        pred_j_clean = pred_j_clean[idx]
+                        if pred_v_clean is not None:
+                            pred_v_clean = pred_v_clean[idx]
+
+                    out_mask = model(
+                        img_mask,
+                        cam_param=cam_mask,
+                        apply_rgb_token_mask=True,
+                        rgb_mask_ratio=epoch_mask_ratio,
+                        rgb_mask_mode=mask_mode,
+                        rgb_mask_fill=mask_fill,
+                    )
+                    pred_j_mask = out_mask["pred_keypoints_3d"]
+                    ri = int(root_index)
+                    pred_j_clean_rr = pred_j_clean - pred_j_clean[:, [ri]]
+                    pred_j_mask_rr = pred_j_mask - pred_j_mask[:, [ri]]
+                    loss_cons_term = torch.zeros((), device=device, dtype=pred_j_mask.dtype)
+                    if epoch_cons_w_3d > 0.0:
+                        loss_consistency_3d = torch.nn.functional.smooth_l1_loss(pred_j_mask_rr, pred_j_clean_rr)
+                        loss_dict["loss_consistency_3d"] = loss_consistency_3d
+                        loss_cons_term = loss_cons_term + epoch_cons_w_3d * loss_consistency_3d
+                    if epoch_cons_w_mesh > 0.0 and pred_v_clean is not None:
+                        pred_v_mask = out_mask["pred_vertices"]
+                        pred_v_clean_rr = pred_v_clean - pred_j_clean[:, [ri]]
+                        pred_v_mask_rr = pred_v_mask - pred_j_mask[:, [ri]]
+                        loss_consistency_mesh = torch.nn.functional.smooth_l1_loss(pred_v_mask_rr, pred_v_clean_rr)
+                        loss_dict["loss_consistency_mesh"] = loss_consistency_mesh
+                        loss_cons_term = loss_cons_term + epoch_cons_w_mesh * loss_consistency_mesh
+                    _skip_cons = torch.tensor([int(not torch.isfinite(loss_cons_term))], device=device)
+                    if distributed:
+                        dist.all_reduce(_skip_cons, op=dist.ReduceOp.MAX)
+                    if _skip_cons.item():
+                        if is_main_process():
+                            print("[warn] Non-finite consistency loss encountered; skipping consistency backward this step.")
+                    else:
+                        loss_cons_term.backward()
+                        loss_for_log = loss_for_log + loss_cons_term.detach()
+
             # Optional grad clipping for stability (configure train.grad_clip_norm)
             clip = float(cfg.get("train", {}).get("grad_clip_norm", 0.0) or 0.0)
             if clip > 0:
@@ -953,7 +1226,7 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
                 model_ema.update(base_model)
 
             # rank-avg loss for logging
-            loss_val = torch.tensor([float(loss.item())], device=device)
+            loss_val = torch.tensor([float(loss_for_log.item())], device=device)
             if distributed:
                 all_reduce_sum(loss_val)
                 loss_val = loss_val / float(dist_info.world_size)
@@ -970,6 +1243,9 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
                 "loss_global_orient",
                 "loss_hand_pose",
                 "loss_betas",
+                "loss_shape",
+                "loss_consistency_3d",
+                "loss_consistency_mesh",
             ]
             subloss_vals = {}
             for k in base_loss_keys:
@@ -1028,7 +1304,7 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
                 torch.cuda.empty_cache()
             # Use EMA model for evaluation if available
             eval_model = model_ema.module() if model_ema is not None else model
-            train_mpjpe_mm, train_pampjpe_mm = evaluate_epoch(
+            train_metrics = evaluate_epoch(
                 eval_model,
                 train_loader,
                 device,
@@ -1040,8 +1316,10 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
             if is_main_process():
                 ema_tag = " (EMA)" if model_ema is not None else ""
                 print(
-                    f"[epoch {epoch}] train{ema_tag} MPJPE(mm)={train_mpjpe_mm:.3f}  "
-                    f"PA-MPJPE(mm)={train_pampjpe_mm:.3f}"
+                    f"[epoch {epoch}] train{ema_tag} MPJPE(mm)={train_metrics['MPJPE_mm']:.3f}  "
+                    f"PA-MPJPE(mm)={train_metrics['PA-MPJPE_mm']:.3f}  "
+                    f"MPVPE(mm)={train_metrics['MPVPE_mm']:.3f}  "
+                    f"PA-MPVPE(mm)={train_metrics['PA-MPVPE_mm']:.3f}"
                 )
 
         # Print epoch-mean sublosses
@@ -1058,7 +1336,7 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
             torch.cuda.empty_cache()
         # Use EMA model for evaluation if available
         eval_model = model_ema.module() if model_ema is not None else model
-        mpjpe_mm, pampjpe_mm = evaluate_epoch(
+        val_metrics = evaluate_epoch(
             eval_model,
             val_loader,
             device,
@@ -1069,11 +1347,39 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
         )
         if is_main_process():
             ema_tag = " (EMA)" if model_ema is not None else ""
-            print(f"[epoch {epoch}] val{ema_tag} MPJPE(mm)={mpjpe_mm:.3f}  PA-MPJPE(mm)={pampjpe_mm:.3f}")
+            mpjpe_mm = float(val_metrics["MPJPE_mm"])
+            pampjpe_mm = float(val_metrics["PA-MPJPE_mm"])
+            mpvpe_mm = float(val_metrics["MPVPE_mm"])
+            pampvpe_mm = float(val_metrics["PA-MPVPE_mm"])
+            print(
+                f"[epoch {epoch}] val{ema_tag} MPJPE(mm)={mpjpe_mm:.3f}  "
+                f"PA-MPJPE(mm)={pampjpe_mm:.3f}  "
+                f"MPVPE(mm)={mpvpe_mm:.3f}  "
+                f"PA-MPVPE(mm)={pampvpe_mm:.3f}"
+            )
+            # Multimodal diagnostics: track whether geometry gate is actually learning.
+            model_core = model.module if isinstance(model, DDP) else model
+            enc = getattr(model_core, "encoder", None)
+            if enc is not None and hasattr(enc, "sum_geo_gate"):
+                gate_raw = float(enc.sum_geo_gate.detach().cpu().item())
+                gate_sigmoid = 1.0 / (1.0 + math.exp(-gate_raw))
+                print(f"[epoch {epoch}] geo_gate raw={gate_raw:.4f} sigmoid={gate_sigmoid:.4f}")
 
-            # Save only when test/val PA-MPJPE improves (decreases)
-            if pampjpe_mm < best_pampjpe_mm:
+            current_ckpt_score = pampjpe_mm
+            current_ckpt_desc = f"PA-MPJPE={pampjpe_mm:.3f}mm"
+            if best_ckpt_metric == "joint_mesh":
+                mesh_term = pampvpe_mm if math.isfinite(pampvpe_mm) else pampjpe_mm
+                current_ckpt_score = 0.5 * (pampjpe_mm + mesh_term)
+                current_ckpt_desc = (
+                    f"joint_mesh_avg={current_ckpt_score:.3f} "
+                    f"(PA-MPJPE={pampjpe_mm:.3f}, PA-MPVPE={pampvpe_mm:.3f})"
+                )
+                print(f"[epoch {epoch}] ckpt metric={current_ckpt_desc}")
+
+            if current_ckpt_score < best_ckpt_score:
+                best_ckpt_score = current_ckpt_score
                 best_pampjpe_mm = pampjpe_mm
+                best_pampvpe_mm = pampvpe_mm
                 ckpt_path = out_dir / "gpgformer_best.pt"
                 model_to_save = model.module if isinstance(model, DDP) else model
 
@@ -1084,7 +1390,12 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
                     "cfg": cfg,
                     "val_mpjpe_mm": mpjpe_mm,
                     "val_pampjpe_mm": pampjpe_mm,
+                    "val_mpvpe_mm": mpvpe_mm,
+                    "val_pampvpe_mm": pampvpe_mm,
                     "best_val_pampjpe_mm": best_pampjpe_mm,
+                    "best_val_pampvpe_mm": best_pampvpe_mm,
+                    "best_ckpt_metric": best_ckpt_metric,
+                    "best_ckpt_score": best_ckpt_score,
                 }
 
                 # Save EMA model state if available
@@ -1101,9 +1412,16 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
                 print(f"[epoch {epoch}] saving best checkpoint to: {ckpt_path}", flush=True)
                 torch.save(checkpoint, tmp_path)
                 tmp_path.replace(ckpt_path)
-                print(f"[epoch {epoch}] saved best checkpoint: {ckpt_path} (best PA-MPJPE={best_pampjpe_mm:.3f}mm)")
+                print(f"[epoch {epoch}] saved best checkpoint: {ckpt_path} ({current_ckpt_desc})")
             else:
-                print(f"[epoch {epoch}] not saving (best PA-MPJPE={best_pampjpe_mm:.3f}mm)")
+                if best_ckpt_metric == "joint_mesh":
+                    best_desc = (
+                        f"best joint_mesh_avg={best_ckpt_score:.3f} "
+                        f"(best PA-MPJPE={best_pampjpe_mm:.3f}, best PA-MPVPE={best_pampvpe_mm:.3f})"
+                    )
+                else:
+                    best_desc = f"best PA-MPJPE={best_pampjpe_mm:.3f}mm"
+                print(f"[epoch {epoch}] not saving ({best_desc})")
 
         # IMPORTANT (DDP + slow checkpoint I/O):
         # Synchronize ranks at epoch end so non-rank0 workers don't start the next epoch while rank0 is saving.
