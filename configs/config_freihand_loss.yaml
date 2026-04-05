@@ -187,4 +187,4 @@ train:
   # Whether to run train-set metrics after each epoch
   eval_train_metrics: false #打印训练集的指标
   num_workers: 32
-  out_dir: /root/code/vepfs/GPGFormer/checkpoints/ablations/freihand_20260307_vitpose
+  out_dir: /root/code/vepfs/GPGFormer/checkpoints/ablations/training_freihand_20260306_loss

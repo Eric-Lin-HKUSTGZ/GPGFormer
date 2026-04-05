@@ -77,19 +77,27 @@ def barrier() -> None:
         dist.barrier()
 
 
-def seed_everything(seed: int, rank: int = 0) -> None:
+def seed_everything(seed: int, rank: int = 0, deterministic: bool = False) -> None:
     s = int(seed) + int(rank)
     random.seed(s)
     np.random.seed(s)
     torch.manual_seed(s)
     torch.cuda.manual_seed_all(s)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = bool(deterministic)
+        torch.backends.cudnn.benchmark = not bool(deterministic)
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except TypeError:
+            torch.use_deterministic_algorithms(True)
 
 
 def all_reduce_sum(t: torch.Tensor) -> torch.Tensor:
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
     return t
-
 
 
 

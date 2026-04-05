@@ -13,6 +13,7 @@ import argparse
 import copy
 import sys
 from pathlib import Path
+from typing import Dict
 
 import torch
 import yaml
@@ -72,6 +73,70 @@ def build_mixed_train_dataset(cfg):
     return concat_ds, weights
 
 
+def build_eval_cfg_from_entry(cfg: dict, entry: dict) -> dict:
+    sub_cfg = copy.deepcopy(cfg)
+    sub_cfg["dataset"]["name"] = entry["name"]
+    for k, v in entry.items():
+        if k != "name":
+            sub_cfg["dataset"][k] = v
+    return sub_cfg
+
+
+def build_mixed_eval_loaders(cfg: dict, distributed: bool, dist_info: DistInfo) -> Dict[str, DataLoader]:
+    eval_entries = cfg.get("dataset", {}).get("eval_datasets", [])
+    if not eval_entries:
+        if is_main_process():
+            print("[progress] Building val dataset ...", flush=True)
+        val_ds = build_dataset(cfg, "val")
+        val_sampler = None
+        if distributed:
+            val_sampler = DistributedSampler(
+                val_ds,
+                num_replicas=dist_info.world_size,
+                rank=dist_info.rank,
+                shuffle=False,
+                drop_last=False,
+            )
+        return {
+            str(cfg.get("dataset", {}).get("name", "val")): DataLoader(
+                val_ds,
+                batch_size=int(cfg["train"].get("val_batch_size", cfg["train"]["batch_size"])),
+                shuffle=False,
+                sampler=val_sampler,
+                num_workers=0,
+                pin_memory=True,
+            )
+        }
+
+    loaders: Dict[str, DataLoader] = {}
+    for idx, entry in enumerate(eval_entries):
+        if not isinstance(entry, dict) or "name" not in entry:
+            raise ValueError(f"dataset.eval_datasets[{idx}] must be a dict with a 'name' field, got: {entry!r}")
+        sub_cfg = build_eval_cfg_from_entry(cfg, entry)
+        ds_name = str(entry["name"]).lower()
+        if is_main_process():
+            print(f"[progress] Building val dataset [{ds_name}] ...", flush=True)
+        val_ds = build_dataset(sub_cfg, "val")
+        val_sampler = None
+        if distributed:
+            val_sampler = DistributedSampler(
+                val_ds,
+                num_replicas=dist_info.world_size,
+                rank=dist_info.rank,
+                shuffle=False,
+                drop_last=False,
+            )
+        loaders[ds_name] = DataLoader(
+            val_ds,
+            batch_size=int(cfg["train"].get("val_batch_size", cfg["train"]["batch_size"])),
+            shuffle=False,
+            sampler=val_sampler,
+            num_workers=0,
+            pin_memory=True,
+        )
+    return loaders
+
+
 def main():
     try:
         sys.stdout.reconfigure(line_buffering=True)
@@ -121,26 +186,12 @@ def main():
             collate_fn=mixed_collate_fn,
         )
 
-        # ---- Validation on primary dataset only ----
-        if is_main_process():
-            print("[progress] Building val dataset ...", flush=True)
-        val_ds = build_dataset(cfg, "val")
-
-        val_sampler = None
-        if distributed:
-            val_sampler = DistributedSampler(
-                val_ds, num_replicas=dist_info.world_size,
-                rank=dist_info.rank, shuffle=False, drop_last=False,
-            )
-
-        val_loader = DataLoader(
-            val_ds,
-            batch_size=int(cfg["train"].get("val_batch_size", cfg["train"]["batch_size"])),
-            shuffle=False,
-            sampler=val_sampler,
-            num_workers=0,
-            pin_memory=True,
-        )
+        # ---- Validation / test protocol ----
+        # If dataset.eval_datasets is configured, evaluate on each listed domain and let train_loop
+        # aggregate the metrics sample-wise for checkpoint selection.
+        val_loader = build_mixed_eval_loaders(cfg, distributed=distributed, dist_info=dist_info)
+        if len(val_loader) == 1:
+            val_loader = next(iter(val_loader.values()))
 
         # Delegate to shared training loop
         train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distributed, device)

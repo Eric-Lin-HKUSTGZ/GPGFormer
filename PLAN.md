@@ -1,0 +1,118 @@
+# Hand Mesh 对比可视化脚本方案
+
+## Summary
+- 在 `/root/code/hand_reconstruction/GPGFormer/visualization/compare_hand_meshes.py` 新增一个主脚本，统一完成数据集读取、四个模型推理、GT mesh 构建、pyrender 渲染和拼图导出。
+- 默认支持 `freihand / dexycb / ho3d` 三套测试数据，默认用同一份 GT/标签裁剪信息做公平对比，而不是各自跑检测器。
+- 默认输出“单样本总览图”，每个样本一张 2x6 拼图，并同时保存各方法的单独 overlay 图和单独 mesh 图，方便复用与排版。
+
+## Key Changes
+- 数据接入统一走 GPGFormer 现有 loader 语义，不重写数据规范：
+  - `freihand` 使用 `FreiHANDDataset(train=False, use_trainval_split=False, eval_root=...)`
+  - `dexycb` 使用 `DexYCBDataset(setup='s0', split='test', train=False)`
+  - `ho3d` 使用 `HO3DDataset(data_split='evaluation', train=False)`，优先用官方 evaluation GT
+- 在脚本内部定义统一样本结构 `SampleBundle`，至少包含：
+  - `dataset_name`
+  - `sample_idx`
+  - `full_image_bgr`
+  - `img_path`
+  - `box_center`
+  - `box_size`
+  - `img_size_wh`
+  - `cam_param_full`
+  - `crop_rgb_gpgformer`
+  - `is_right`
+  - `gt_joints_3d`
+  - `gt_joints_2d`
+  - `gt_vertices`
+  - `gt_faces`
+- GT mesh 生成策略固定：
+  - `freihand`：从 loader 的 `mano_params` 用 GPGFormer/WiLoR 兼容 MANO 解码得到 GT 顶点，再用 GT 3D-2D + K 求相机平移
+  - `dexycb`：优先用标注里的 MANO 参数解码 GT 顶点；若有 `mano_trans` 直接用，否则同样由 GT 3D-2D + K 求平移
+  - `ho3d`：优先用 loader/official eval JSON 里的 GT vertices；若缺失则回退到 MANO 参数解码
+- 四个模型统一封装成脚本内四个 runner，输出统一的 `PredictionBundle`：
+  - `gpgformer`: 直接复用 GPGFormer config + checkpoint 加载；输入用 loader 返回的 crop 和 crop 内参；输出 `pred_vertices / pred_keypoints_3d / pred_cam_t`
+  - `wilor`: 复用 `load_wilor` 和 `ViTDetDataset`，但 bbox 改为当前样本的 GT box；输出用 `cam_crop_to_full` 还原全图 `cam_t`
+  - `hamer`: 复用 `load_hamer` 和 `ViTDetDataset`，同样使用 GT box 与 `is_right`；不走 detectron/vitpose；输出用 `cam_crop_to_full` 还原全图 `cam_t`
+  - `simplehand`: 直接加载 `HandNet` 权重；用脚本内复刻的 simpleHand eval 几何预处理生成 `224x224` crop、`trans_matrix_2d/3d` 和新内参；推理后将预测 joints/vertices 逆变换回原始相机坐标，再通过 GT 2D + 全图内参最小二乘求 `cam_t`
+- 推理统一约定：
+  - `WiLoR/HaMeR` 保持原仓库前向接口，输入为 batch dict
+  - `GPGFormer` 输入 crop tensor + crop `cam_param`
+  - `simpleHand` 输入图像 tensor，输出后做逆变换和相机恢复
+- 渲染与配色固定：
+  - 基于 `pyrender + trimesh`，参考现有 `pyrender_mesh_demo.py` 和 WiLoR/HaMeR renderer 的灯光设置
+  - 开启 `smooth=True`，白底，环境光 + raymond lights，材质使用 `MetallicRoughnessMaterial`
+  - 颜色固定：
+    - `GT`: 浅灰 `#D9D9D9`
+    - `GPGFormer`: 淡紫蓝 `#7677D8`
+    - `WiLoR`: 暖橙 `#E8B07A`
+    - `HaMeR`: 冰蓝 `#D7E7FA`
+    - `SimpleHand`: 薄荷绿 `#9FC9A6`
+- 输出版式固定为单样本 2x6：
+  - 第一行：`Image | GT Overlay | GPGFormer Overlay | WiLoR Overlay | HaMeR Overlay | SimpleHand Overlay`
+  - 第二行：`GT Mesh | GT Info | GPGFormer Mesh | WiLoR Mesh | HaMeR Mesh | SimpleHand Mesh`
+  - `GT Info` 面板显示数据集名、样本索引、手别、可选误差摘要
+- 额外导出文件：
+  - 每个样本保存一张总览图
+  - 每个方法保存单独 overlay 图
+  - 每个方法保存单独 mesh-only 图
+  - 可选保存 `summary.json`，记录索引、图像路径、是否右手、各方法输出文件名与相机恢复状态
+- CLI 接口固定：
+  - `--dataset {freihand,dexycb,ho3d}`
+  - `--split`，默认 `evaluation/test` 对应各数据集常用测试划分
+  - `--indices` 或 `--index`
+  - `--num-samples`
+  - `--out-dir`
+  - `--device`
+  - `--batch-size`
+  - `--render-size`
+  - `--save-individual`
+  - 四个 checkpoint 参数都提供，但默认值直接使用你给的绝对路径
+
+## Public APIs / Interfaces
+- 主入口：
+  - `/root/code/hand_reconstruction/GPGFormer/visualization/compare_hand_meshes.py`
+- 对外命令形式：
+  - `python visualization/compare_hand_meshes.py --dataset freihand --indices 0 10 25`
+  - `python visualization/compare_hand_meshes.py --dataset dexycb --num-samples 20`
+- 脚本内部统一接口：
+  - `build_dataset(dataset_name, split, device) -> dataset`
+  - `make_sample_bundle(dataset, idx) -> SampleBundle`
+  - `run_gpgformer(sample) -> PredictionBundle`
+  - `run_wilor(sample) -> PredictionBundle`
+  - `run_hamer(sample) -> PredictionBundle`
+  - `run_simplehand(sample) -> PredictionBundle`
+  - `render_overlay(full_image, vertices, faces, cam_t, cam_param, color, is_right) -> image`
+  - `render_mesh_only(vertices, faces, color, is_right) -> image`
+  - `compose_panel(sample, gt_pred, preds_by_method) -> image`
+
+## Test Plan
+- `freihand / dexycb / ho3d` 各跑 1 个样本 smoke test：
+  - 能成功加载数据
+  - 四个模型都能前向
+  - 总览图与单独图都成功写出
+- 对 `simpleHand` 单独验证：
+  - 逆变换后的 `pred_vertices` 形状为 `(778, 3)`
+  - 相机恢复返回有限值
+  - overlay 后 mesh 不全黑、不全透明
+- 对 `WiLoR/HaMeR` 单独验证：
+  - GT box 驱动的 `ViTDetDataset` 能返回合法 batch
+  - `cam_crop_to_full` 后的 `cam_t` 为有限值
+- 对 GT mesh 验证：
+  - 三个数据集都能拿到 `gt_vertices`
+  - GT overlay 能正常投影到原图
+- 视觉验收：
+  - 颜色区分明显
+  - mesh 表面平滑、法线方向正确
+  - 左手样本不会出现面翻转错误
+  - 第二行 mesh-only 图与第一行 overlay 使用同一 mesh 拓扑和颜色
+
+## Assumptions / Defaults
+- 已确认默认只做“单样本总览图”，不额外实现多样本 contact sheet。
+- 已确认默认采用“统一 GT 裁剪”模式；不实现各方法 detector-native 流程作为默认主路径。
+- 默认数据根路径沿用 GPGFormer 配置中的现有路径：
+  - FreiHAND: `/root/code/vepfs/dataset/FreiHAND_pub_v2` 与 `/root/code/vepfs/dataset/FreiHAND_pub_v2_eval`
+  - Dex-YCB: `/root/code/vepfs/dataset/dex-ycb`
+  - HO3D: `/root/code/vepfs/dataset/HO3D_v3`
+- 默认 checkpoint 路径使用你提供的四个绝对路径。
+- `simpleHand` 的三数据集支持基于统一裁剪与逆变换适配实现，不依赖其原仓库的 FreiHAND-only eval pipeline。
+- 若个别样本 GT mesh 无法直接从标注拿到，脚本会按“显式顶点优先、MANO 解码其次、否则报错跳过”的顺序处理，不静默伪造 GT。

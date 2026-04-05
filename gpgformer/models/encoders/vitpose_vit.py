@@ -23,6 +23,7 @@ class ViTPoseViTConfig:
     # Learnable scalar gate for geometry injection in sum mode; effective gate is sigmoid(param).
     sum_geo_gate_init: float = 4.0
     fusion_proj_zero_init: bool = True
+    fusion_proj_init_mode: str = "small"
     cross_attn_num_heads: int = 8
     cross_attn_dropout: float = 0.0
     cross_attn_gate_init: float = 0.0
@@ -67,10 +68,24 @@ class ViTPoseViTWithGeo(nn.Module):
                     nn.GELU(),
                     nn.Linear(embed_dim, embed_dim)
                 )
-                if bool(getattr(cfg, "fusion_proj_zero_init", True)):
-                    nn.init.zeros_(self.fusion_proj[-1].weight)
-                    if self.fusion_proj[-1].bias is not None:
-                        nn.init.zeros_(self.fusion_proj[-1].bias)
+                last = self.fusion_proj[-1]
+                init_mode = str(getattr(cfg, "fusion_proj_init_mode", "")).strip().lower()
+                if not init_mode:
+                    init_mode = "small" if bool(getattr(cfg, "fusion_proj_zero_init", True)) else "default"
+                if init_mode not in {"small", "zero", "default"}:
+                    raise ValueError(f"Unsupported fusion_proj_init_mode: {init_mode}")
+                if init_mode == "small":
+                    nn.init.normal_(last.weight, mean=0.0, std=1e-3)
+                    if last.bias is not None:
+                        nn.init.zeros_(last.bias)
+                    print("[ViTPoseViTWithGeo] channel_concat Proj last layer small-init enabled")
+                elif init_mode == "zero":
+                    nn.init.zeros_(last.weight)
+                    if last.bias is not None:
+                        nn.init.zeros_(last.bias)
+                    print("[ViTPoseViTWithGeo] channel_concat Proj last layer zero-init enabled")
+                else:
+                    print("[ViTPoseViTWithGeo] channel_concat Proj last layer default-init enabled")
 
         if self.token_fusion_mode == "cross_attn":
             embed_dim = self.backbone.embed_dim

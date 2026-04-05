@@ -193,9 +193,10 @@ class HO3DJsonDataset(Dataset):
         brightness_prob: float = 0.5,
         contrast_prob: float = 0.5,
     ):
-        self.data_split = str(data_split).lower()
-        if self.data_split == "test":
-            self.data_split = "evaluation"
+        split_name = str(data_split).lower()
+        # JSON mode is intentionally strict: only the configured train JSON is used for
+        # training, and every non-train split uses the configured test/evaluation JSON.
+        self.data_split = "train" if split_name == "train" else "evaluation"
 
         self.root_dir = root_dir
         self.train_json_path = train_json_path
@@ -244,10 +245,7 @@ class HO3DJsonDataset(Dataset):
         return len(self.datalist)
 
     def _cache_path(self) -> str:
-        if self.data_split in ("train", "val", "train_all"):
-            src = self.train_json_path
-        else:
-            src = self.test_json_path
+        src = self.train_json_path if self.data_split == "train" else self.test_json_path
         st = os.stat(src)
         # Bump this when datalist semantics change (prevents stale, incompatible cache reuse).
         cache_version = "v4_meta_mano_mesh"
@@ -347,19 +345,16 @@ class HO3DJsonDataset(Dataset):
             if i > 0 and i % 50000 == 0 and str(os.environ.get("RANK", "0")) == "0":
                 print(f"[ho3d_json] parsed images: {i}", flush=True)
 
-        if split_mode == "train_all":
+        if split_mode == "train":
             selected_ids = {int(i) for i, _ in image_items}
-        elif split_mode in ("train", "val"):
-            train_ids, val_ids = self._split_train_ids(image_items)
-            selected_ids = set(train_ids if split_mode == "train" else val_ids)
         elif split_mode in ("evaluation", "test"):
             selected_ids = {int(i) for i, _ in image_items}
         else:
             raise ValueError(f"Unsupported split mode: {split_mode}")
 
-        # For train/val, JSON is used for split indexing; metric supervision comes from HO3D meta/*.pkl.
+        # For train, JSON is used for indexing; metric supervision comes from HO3D meta/*.pkl.
         # Avoid scanning huge `annotations` here to reduce startup time and perceived "hang".
-        if split_mode in ("train", "val", "train_all"):
+        if split_mode == "train":
             ordered_ids = [int(i) for i, _ in image_items if int(i) in selected_ids]
             total = len(ordered_ids)
             datalist: List[Dict[str, Any]] = []
@@ -430,7 +425,7 @@ class HO3DJsonDataset(Dataset):
 
                 if j > 0 and j % 5000 == 0 and str(os.environ.get("RANK", "0")) == "0":
                     print(
-                        f"[ho3d_json] loading train/val meta: {j}/{total}, kept={len(datalist)}, "
+                        f"[ho3d_json] loading train meta: {j}/{total}, kept={len(datalist)}, "
                         f"missing_meta={n_missing_meta}, invalid_meta={n_invalid_meta}",
                         flush=True,
                     )
@@ -548,12 +543,12 @@ class HO3DJsonDataset(Dataset):
         return datalist
 
     def load_data(self) -> List[Dict[str, Any]]:
-        if self.data_split in ("train", "val", "train_all"):
+        if self.data_split == "train":
             json_path = self.train_json_path
-            split_mode = self.data_split
+            split_mode = "train"
         else:
             json_path = self.test_json_path
-            split_mode = self.data_split
+            split_mode = "evaluation"
 
         if not json_path or (not osp.exists(json_path)):
             raise FileNotFoundError(

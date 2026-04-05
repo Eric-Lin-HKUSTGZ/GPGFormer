@@ -128,8 +128,8 @@ train:
   use_cuda: true
   # Keep the longer schedule from currentcode; the late epochs were still improving.
   epochs: 60
-  batch_size: 96
-  val_batch_size: 96
+  batch_size: 90
+  val_batch_size: 90
   lr: 2e-5
   weight_decay: 1e-4
   lr_multiplier:
@@ -170,6 +170,7 @@ train:
   eval_train_metrics: false
   num_workers: 32
   best_ckpt_metric: joint_mesh
+  deterministic: true
   out_dir: /root/code/vepfs/GPGFormer/checkpoints/freihand_loss_beta_mesh_target51_recommended_20260315
 
 metrics:

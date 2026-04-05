@@ -1,0 +1,183 @@
+dataset:
+  name: freihand
+  img_size: 256
+  root_index: 9
+  use_trainval_split: false
+  trainval_ratio: 0.9
+  trainval_seed: 42
+  align_wilor_aug: true
+  bbox_source_eval: detector
+  wilor_aug_config:
+    SCALE_FACTOR: 0.3
+    ROT_FACTOR: 30
+    TRANS_FACTOR: 0.02
+    COLOR_SCALE: 0.2
+    ROT_AUG_RATE: 0.6
+    TRANS_AUG_RATE: 0.5
+    DO_FLIP: false
+    FLIP_AUG_RATE: 0.0
+    EXTREME_CROP_AUG_RATE: 0.0
+    EXTREME_CROP_AUG_LEVEL: 1
+
+paths:
+  freihand_root: /root/code/vepfs/dataset/FreiHAND_pub_v2
+  freihand_eval_root: /root/code/vepfs/dataset/FreiHAND_pub_v2_eval
+  wilor_ckpt: /root/code/vepfs/GPGFormer/weights/wilor_final.ckpt
+  vitpose_ckpt: /root/code/hand_reconstruction/WiLoR/pretrained_models/vitpose-l.pth
+  detector_ckpt: /root/code/vepfs/GPGFormer/weights/detector.pt
+  moge2_ckpt: /root/code/vepfs/GPGFormer/weights/model.pt
+  mano_dir: /root/code/vepfs/GPGFormer/weights/mano
+  mano_mean_params: /root/code/vepfs/GPGFormer/weights/mano/mano_mean_params.npz
+
+model:
+  backbone_type: wilor
+  image_size: 256
+  focal_length: 5000
+  use_geo_prior: false
+  moge2_num_tokens: 400
+  moge2_output: neck
+  token_fusion_mode: sum
+  sum_fusion_strategy: channel_concat
+  sum_geo_gate_init: -1.2
+  fusion_proj_zero_init: true
+  # Keep more geometry than the old stable file, but avoid the looser currentcode setting.
+  geo_branch_dropout_prob: 0.04
+  cross_attn_num_heads: 8
+  cross_attn_dropout: 0.0
+  cross_attn_gate_init: 0.0
+  side_tuning:
+    enabled: false
+    side_channels: 256
+    dropout: 0.05
+    max_res_scale: 0.1
+    init_res_scale: 0.001
+  geo_side_adapter:
+    enabled: true
+    side_channels: 128
+    depth: 2
+    dropout: 0.05
+    norm_groups: 32
+  geo_tokenizer_use_pooling: true
+  mano_decoder: wilor
+  freihand_mano_root: /root/code/hand_reconstruction/freihand/data
+  mano_head:
+    ief_iters: 3
+    transformer_input: mean_shape
+    dim: 1024
+    depth: 6
+    heads: 8
+    dim_head: 64
+    mlp_dim: 2048
+    dropout: 0.0
+  feature_refiner:
+    method: sjta
+    feat_dim: 1280
+    sjta_bottleneck_dim: 256
+    sjta_num_heads: 4
+    sjta_use_2d_prior: true
+    sjta_num_steps: 2
+    coear_dilation1: 1
+    coear_dilation2: 2
+    coear_gate_reduction: 8
+    coear_init_alpha: 0.1
+    wilor_msf_bottleneck_ratio: 4
+    wilor_msf_dilation1: 1
+    wilor_msf_dilation2: 2
+    wilor_msf_dilation3: 3
+    wilor_msf_gate_reduction: 8
+    wilor_msf_init_alpha: 0.1
+    kcr_num_keypoints: 21
+    kcr_hidden_dim: 128
+
+loss:
+  reduction: mean
+  w_2d: 1.0
+  w_kcr_2d: 1.0
+  w_3d_joint: 5.0
+  w_bone_length: 1.0
+  joint_3d_tip_weight: 2.5
+  tip_joint_indices: [4, 8, 12, 16, 20]
+  bone_pairs:
+    - [0, 1]
+    - [1, 2]
+    - [2, 3]
+    - [3, 4]
+    - [0, 5]
+    - [5, 6]
+    - [6, 7]
+    - [7, 8]
+    - [0, 9]
+    - [9, 10]
+    - [10, 11]
+    - [11, 12]
+    - [0, 13]
+    - [13, 14]
+    - [14, 15]
+    - [15, 16]
+    - [0, 17]
+    - [17, 18]
+    - [18, 19]
+    - [19, 20]
+  # Keep the mesh term from currentcode, which improved both PA metrics on the current branch.
+  w_3d_vert: 0.10
+  w_global_orient: 0.4
+  w_hand_pose: 0.4
+  w_scale: 0.0
+  # Restore part of the shape regularization lost in currentcode while keeping a light beta anchor.
+  w_betas: 0.01
+  w_shape: 0.05
+  mano_param_loss_type: smooth_l1
+  mano_param_smooth_l1_beta: 0.05
+  mano_param_per_sample_clip: 1.0
+
+train:
+  use_cuda: true
+  # Keep the longer schedule from currentcode; the late epochs were still improving.
+  epochs: 60
+  batch_size: 64
+  val_batch_size: 64
+  lr: 2e-5
+  weight_decay: 1e-4
+  lr_multiplier:
+    backbone: 0.5
+    head: 2.0
+    geo_fusion: 0.25
+    side_tuning: 0.8
+  warmup_epochs: 8
+  geo_fusion_start_factor: 0.05
+  geo_fusion_ramp_epochs: 20
+  side_tuning_start_factor: 0.1
+  side_tuning_ramp_epochs: 12
+  min_lr: 5e-7
+  seed: 42
+
+  # Main-forward masking consistently hurt both PA-MPJPE and PA-MPVPE in the 2026-03-13/14 sweeps.
+  rgb_token_mask:
+    enabled: false
+    apply_to_main_forward: false
+    apply_prob: 0.0
+    ratio_start: 0.0
+    ratio_end: 0.0
+    ramp_epochs: 0
+    mode: block
+    fill: zero
+
+  consistency:
+    enabled: false
+    w_3d: 0.0
+    w_mesh: 0.0
+    start_factor: 1.0
+    ramp_epochs: 0
+    max_samples: 0
+
+  grad_clip_norm: 1.0
+  use_ema: false
+  ema_decay: 0.9998
+  eval_train_metrics: false
+  num_workers: 32
+  best_ckpt_metric: joint_mesh
+  deterministic: true
+  out_dir: /root/code/vepfs/GPGFormer/checkpoints/ablations_v2/freihand_rgb_only_20260317
+
+metrics:
+  mesh_fallback_kp_consistency_thr_mm: 40.0

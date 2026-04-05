@@ -76,7 +76,7 @@ def compute_auc(errors_mm: np.ndarray, val_min_mm: float = 0.0, val_max_mm: floa
     thresholds = np.linspace(val_min_mm, val_max_mm, steps, dtype=np.float64)
     pck = np.array([(errors_mm <= t).mean() for t in thresholds], dtype=np.float64)
     denom = max(float(val_max_mm - val_min_mm), 1e-9)
-    auc = float(np.trapz(pck, thresholds) / denom)
+    auc = float(np.trapezoid(pck, thresholds) / denom)
     return auc, pck, thresholds
 
 
@@ -134,69 +134,66 @@ def build_dataset(cfg: dict):
         ho3d_train_json = str(cfg["paths"].get("ho3d_train_json", "")).strip()
         ho3d_test_json = str(cfg["paths"].get("ho3d_test_json", "")).strip()
         ho3d_eval_split = str(cfg["dataset"].get("ho3d_eval_split", "val")).lower()
-
-        # if use_ho3d_json:
-        if ho3d_eval_split in ("train", "val", "train_all"):
-            required_json = ho3d_train_json
-            required_json_key = "paths.ho3d_train_json"
-        else:
+        if use_ho3d_json:
+            json_split = "evaluation"
             required_json = ho3d_test_json
             required_json_key = "paths.ho3d_test_json"
 
-        config_hint = str(cfg.get("__config_path__", "<unknown>"))
-        if not required_json:
-            raise FileNotFoundError(
-                f"dataset.name=ho3d with dataset.ho3d_use_json_split=true, "
-                f"but {required_json_key} is empty for split '{ho3d_eval_split}'. "
-                f"config={config_hint}"
-            )
-        if not osp.exists(required_json):
-            raise FileNotFoundError(
-                f"dataset.name=ho3d with dataset.ho3d_use_json_split=true, "
-                f"but {required_json_key} does not exist: {required_json}. "
-                f"split='{ho3d_eval_split}', config={config_hint}"
+            config_hint = str(cfg.get("__config_path__", "<unknown>"))
+            if not required_json:
+                raise FileNotFoundError(
+                    f"dataset.name=ho3d with dataset.ho3d_use_json_split=true, "
+                    f"but {required_json_key} is empty for split '{json_split}'. "
+                    f"config={config_hint}"
+                )
+            if not osp.exists(required_json):
+                raise FileNotFoundError(
+                    f"dataset.name=ho3d with dataset.ho3d_use_json_split=true, "
+                    f"but {required_json_key} does not exist: {required_json}. "
+                    f"split='{json_split}', config={config_hint}"
+                )
+
+            from data.ho3d_json_dataset import HO3DJsonDataset
+
+            return HO3DJsonDataset(
+                data_split=json_split,
+                root_dir=cfg["paths"]["ho3d_root"],
+                train_json_path=ho3d_train_json,
+                test_json_path=ho3d_test_json,
+                img_size=int(cfg["dataset"].get("img_size", 256)),
+                train=False,
+                align_wilor_aug=bool(cfg["dataset"].get("align_wilor_aug", True)),
+                wilor_aug_config=cfg["dataset"].get("wilor_aug_config", {}),
+                bbox_source=bbox_source,
+                detector_weights_path=detector_path,
+                trainval_ratio=float(cfg["dataset"].get("ho3d_trainval_ratio", 0.9)),
+                trainval_seed=int(cfg["dataset"].get("ho3d_trainval_seed", 42)),
+                trainval_split_by=str(cfg["dataset"].get("ho3d_trainval_split_by", "sequence")),
+                root_index=root_index,
+                json_kp3d_unit=str(cfg["dataset"].get("ho3d_json_kp3d_unit", "auto")),
+                json_kp3d_scale=float(cfg["dataset"].get("ho3d_json_kp3d_scale", 1.0)),
+                json_convert_xyz=bool(cfg["dataset"].get("ho3d_json_convert_xyz", False)),
             )
 
-        from data.ho3d_json_dataset import HO3DJsonDataset
+        from data.ho3d_dataset import HO3DDataset
 
-        return HO3DJsonDataset(
+        return HO3DDataset(
             data_split=ho3d_eval_split,
             root_dir=cfg["paths"]["ho3d_root"],
-            train_json_path=ho3d_train_json,
-            test_json_path=ho3d_test_json,
+            dataset_version=cfg["dataset"].get("ho3d_version", "v3"),
             img_size=int(cfg["dataset"].get("img_size", 256)),
+            input_modal="RGB",
             train=False,
             align_wilor_aug=bool(cfg["dataset"].get("align_wilor_aug", True)),
             wilor_aug_config=cfg["dataset"].get("wilor_aug_config", {}),
             bbox_source=bbox_source,
             detector_weights_path=detector_path,
-            trainval_ratio=float(cfg["dataset"].get("ho3d_trainval_ratio", 0.9)),
-            trainval_seed=int(cfg["dataset"].get("ho3d_trainval_seed", 42)),
-            trainval_split_by=str(cfg["dataset"].get("ho3d_trainval_split_by", "sequence")),
+            train_split_file=str(cfg["paths"].get("ho3d_train_split_file", osp.join(cfg["paths"]["ho3d_root"], "train.txt"))),
+            eval_split_file=str(cfg["paths"].get("ho3d_eval_split_file", osp.join(cfg["paths"]["ho3d_root"], "evaluation.txt"))),
+            eval_xyz_json=str(cfg["paths"].get("ho3d_eval_xyz_json", osp.join(cfg["paths"]["ho3d_root"], "evaluation_xyz.json"))),
+            eval_verts_json=str(cfg["paths"].get("ho3d_eval_verts_json", osp.join(cfg["paths"]["ho3d_root"], "evaluation_verts.json"))),
             root_index=root_index,
-            json_kp3d_unit=str(cfg["dataset"].get("ho3d_json_kp3d_unit", "auto")),
-            json_kp3d_scale=float(cfg["dataset"].get("ho3d_json_kp3d_scale", 1.0)),
-            json_convert_xyz=bool(cfg["dataset"].get("ho3d_json_convert_xyz", False)),
         )
-
-        # from data.ho3d_dataset import HO3DDataset
-
-        # return HO3DDataset(
-        #     data_split=ho3d_eval_split,
-        #     root_dir=cfg["paths"]["ho3d_root"],
-        #     dataset_version=cfg["dataset"].get("ho3d_version", "v3"),
-        #     img_size=int(cfg["dataset"].get("img_size", 256)),
-        #     input_modal="RGB",
-        #     train=False,
-        #     align_wilor_aug=bool(cfg["dataset"].get("align_wilor_aug", True)),
-        #     wilor_aug_config=cfg["dataset"].get("wilor_aug_config", {}),
-        #     bbox_source=bbox_source,
-        #     detector_weights_path=detector_path,
-        #     trainval_ratio=float(cfg["dataset"].get("ho3d_trainval_ratio", 0.9)),
-        #     trainval_seed=int(cfg["dataset"].get("ho3d_trainval_seed", 42)),
-        #     trainval_split_by=str(cfg["dataset"].get("ho3d_trainval_split_by", "sequence")),
-        #     root_index=root_index,
-        # )
 
     if name in ("freihand",):
         from data.freihand_dataset_v3 import FreiHANDDatasetV3
@@ -223,12 +220,16 @@ def build_model_from_cfg(cfg: dict) -> GPGFormer:
     model_cfg = cfg.get("model", {})
     refiner_cfg = model_cfg.get("feature_refiner", {})
     moge2_num_tokens = int(model_cfg.get("moge2_num_tokens", 400))
+    side_tuning_cfg = model_cfg.get("side_tuning", {})
+    geo_side_adapter_cfg = model_cfg.get("geo_side_adapter", {})
     if moge2_num_tokens <= 0:
         raise ValueError(f"model.moge2_num_tokens must be a positive int, got {moge2_num_tokens}")
 
     return GPGFormer(
         GPGFormerConfig(
-            wilor_ckpt_path=cfg["paths"]["wilor_ckpt"],
+            backbone_type=str(model_cfg.get("backbone_type", "wilor")),
+            wilor_ckpt_path=cfg["paths"].get("wilor_ckpt", ""),
+            vitpose_ckpt_path=cfg["paths"].get("vitpose_ckpt", ""),
             moge2_weights_path=cfg["paths"].get("moge2_ckpt", None),
             use_geo_prior=bool(model_cfg.get("use_geo_prior", True)),
             mano_model_path=cfg["paths"]["mano_dir"],
@@ -248,11 +249,23 @@ def build_model_from_cfg(cfg: dict) -> GPGFormer:
             moge2_output=str(model_cfg.get("moge2_output", "neck")),
             token_fusion_mode=str(model_cfg.get("token_fusion_mode", "concat")),
             sum_fusion_strategy=str(model_cfg.get("sum_fusion_strategy", "basic")),
+            sum_geo_gate_init=float(model_cfg.get("sum_geo_gate_init", 4.0)),
             fusion_proj_zero_init=bool(model_cfg.get("fusion_proj_zero_init", True)),
             cross_attn_num_heads=int(model_cfg.get("cross_attn_num_heads", 8)),
             cross_attn_dropout=float(model_cfg.get("cross_attn_dropout", 0.0)),
             cross_attn_gate_init=float(model_cfg.get("cross_attn_gate_init", 0.0)),
             geo_tokenizer_use_pooling=bool(model_cfg.get("geo_tokenizer_use_pooling", True)),
+            use_geo_side_tuning=bool(side_tuning_cfg.get("enabled", False)),
+            geo_side_tuning_side_channels=int(side_tuning_cfg.get("side_channels", 256)),
+            geo_side_tuning_dropout=float(side_tuning_cfg.get("dropout", 0.1)),
+            geo_side_tuning_max_res_scale=float(side_tuning_cfg.get("max_res_scale", 0.1)),
+            geo_side_tuning_init_res_scale=float(side_tuning_cfg.get("init_res_scale", 1e-3)),
+            use_geo_side_adapter=bool(geo_side_adapter_cfg.get("enabled", False)),
+            geo_side_adapter_side_channels=int(geo_side_adapter_cfg.get("side_channels", 256)),
+            geo_side_adapter_depth=int(geo_side_adapter_cfg.get("depth", 3)),
+            geo_side_adapter_dropout=float(geo_side_adapter_cfg.get("dropout", 0.05)),
+            geo_side_adapter_norm_groups=int(geo_side_adapter_cfg.get("norm_groups", 32)),
+            geo_branch_dropout_prob=float(model_cfg.get("geo_branch_dropout_prob", 0.0)),
             feature_refiner_method=str(refiner_cfg.get("method", "none")),
             feature_refiner_feat_dim=int(refiner_cfg.get("feat_dim", 1280)),
             feature_refiner_sjta_bottleneck_dim=int(refiner_cfg.get("sjta_bottleneck_dim", 256)),
@@ -560,11 +573,13 @@ def infer_single_json(cfg: dict, model: GPGFormer, device: torch.device):
             gt_vert_root_m = gt_joint_root_m
 
         has_mano_mask = _extract_has_mano_mask(batch_data, B, device)
-        valid_vert_mask = valid_joint_mask & has_mano_mask
         if gt_verts_m is None:
             gt_verts_m = torch.zeros_like(pred_vertices_m)
             valid_vert_mask = torch.zeros((B,), device=device, dtype=torch.bool)
         else:
+            # Explicit mesh GT (e.g. HO3D evaluation) should stay valid even when
+            # the dataset intentionally masks out MANO parameters.
+            valid_vert_mask = valid_joint_mask if not used_mano_fallback else (valid_joint_mask & has_mano_mask)
             finite_vert = torch.isfinite(gt_verts_m).all(dim=(1, 2))
             valid_vert_mask = valid_vert_mask & finite_vert
 

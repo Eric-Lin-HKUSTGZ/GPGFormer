@@ -16,14 +16,15 @@ HO3D specifics handled here:
   as SMPL-X MANO's internal joints (16) + 5 fingertip vertices (5):
     [wrist, index(3), middle(3), pinky(3), ring(3), thumb(3), tips(thumb,index,middle,ring,pinky)]
   Therefore we only need to map to the model's 21-joint output order using `WILOR_JOINT_MAP`.
-- Evaluation split: `evaluation.txt` meta files do not include full GT (often only root joint + bbox).
-  We still return a sample with dummy joints/MANO and masks (`has_mano_params`, `uv_valid`, `xyz_valid`)
-  that prevent losses from using missing GT.
+- Split handling: training strictly follows `train.txt`, and evaluation strictly follows
+  `evaluation.txt`. For evaluation GT, this loader reads the official HO3D annotations from
+  `evaluation_xyz.json` / `evaluation_verts.json` instead of carving a val split from train data.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import os.path as osp
 import pickle
@@ -171,10 +172,10 @@ class HO3DDataset(Dataset):
         wilor_aug_config: Dict[str, Any] | None = None,
         bbox_source: str = "gt",
         detector_weights_path: str | None = None,
-        # train/val split carved from train.txt (HO3D v3 evaluation lacks GT)
-        trainval_ratio: float = 0.9,
-        trainval_seed: int = 42,
-        trainval_split_by: str = "sequence",  # "sequence" | "frame"
+        train_split_file: str | None = None,
+        eval_split_file: str | None = None,
+        eval_xyz_json: str | None = None,
+        eval_verts_json: str | None = None,
         root_index: int = 9,
         # extra aug knobs (kept for config compatibility)
         center_jitter_factor: float = 0.05,
@@ -202,6 +203,10 @@ class HO3DDataset(Dataset):
         self.wilor_aug_config = wilor_aug_config or {}
 
         self.bbox_source = str(bbox_source).lower()
+        if (not self.train) and self.data_split in {"evaluation", "test", "val"} and self.bbox_source == "detector":
+            self.bbox_source = "gt"
+            if str(os.environ.get("RANK", "0")) == "0":
+                print("[info] HO3DDataset disables detector bbox during evaluation/test; using label-based crop.")
         self.detector = None
         self.detector_bbox_expand = 1.2
         if self.bbox_source == "detector":
@@ -215,9 +220,10 @@ class HO3DDataset(Dataset):
         elif self.bbox_source != "gt":
             raise ValueError(f"Unsupported bbox_source for HO3DDataset: {self.bbox_source}")
 
-        self.trainval_ratio = float(trainval_ratio)
-        self.trainval_seed = int(trainval_seed)
-        self.trainval_split_by = str(trainval_split_by).lower()
+        self.train_split_file = str(train_split_file or osp.join(self.root_dir, "train.txt"))
+        self.eval_split_file = str(eval_split_file or osp.join(self.root_dir, "evaluation.txt"))
+        self.eval_xyz_json = str(eval_xyz_json or osp.join(self.root_dir, "evaluation_xyz.json"))
+        self.eval_verts_json = str(eval_verts_json or osp.join(self.root_dir, "evaluation_verts.json"))
         self.root_index = int(root_index)
 
         self.center_jitter_factor = float(center_jitter_factor)
@@ -246,66 +252,30 @@ class HO3DDataset(Dataset):
                     out.append(line)
         return out
 
-    def _split_train_lines(self, train_lines: List[str]) -> Tuple[List[str], List[str]]:
-        """
-        Deterministically split train.txt into train/val subsets.
-        - split_by=\"sequence\": group by sequence to avoid leakage, then pack sequences by #frames.
-        - split_by=\"frame\": shuffle individual frames and take first ratio as train.
-        """
-        ratio = float(max(0.0, min(1.0, self.trainval_ratio)))
-        seed = int(self.trainval_seed)
-        if len(train_lines) == 0:
-            return [], []
-        if ratio <= 0.0:
-            return [], list(train_lines)
-        if ratio >= 1.0:
-            return list(train_lines), []
-
-        split_by = str(self.trainval_split_by).lower()
-        if split_by not in ("sequence", "frame"):
-            split_by = "sequence"
-
-        if split_by == "frame":
-            rng = random.Random(seed)
-            lines = list(train_lines)
-            rng.shuffle(lines)
-            cut = int(len(lines) * ratio)
-            return lines[:cut], lines[cut:]
-
-        seq_to_lines: Dict[str, List[str]] = {}
-        for ln in train_lines:
-            parts = ln.split("/")
-            if len(parts) != 2:
-                continue
-            seq_to_lines.setdefault(parts[0], []).append(ln)
-
-        seqs = list(seq_to_lines.keys())
-        rng = random.Random(seed)
-        rng.shuffle(seqs)
-
-        total = sum(len(v) for v in seq_to_lines.values())
-        target = int(total * ratio)
-
-        train_out: List[str] = []
-        val_out: List[str] = []
-        count = 0
-        for seq in seqs:
-            bucket = seq_to_lines[seq]
-            if count < target:
-                train_out.extend(bucket)
-                count += len(bucket)
-            else:
-                val_out.extend(bucket)
-
-        if len(train_out) == 0 and len(val_out) > 0:
-            train_out.append(val_out.pop(0))
-        if len(val_out) == 0 and len(train_out) > 1:
-            val_out.append(train_out.pop())
-        return train_out, val_out
+    @staticmethod
+    def _load_json_list(json_path: str, *, name: str) -> List[Any]:
+        if not osp.exists(json_path):
+            raise FileNotFoundError(f"Required HO3D {name} file not found: {json_path}")
+        with open(json_path, "r") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            raise TypeError(f"Expected HO3D {name} file to be a JSON list, got {type(data).__name__}: {json_path}")
+        return data
 
     def _cache_path(self, split_name: str) -> str:
         """Return a deterministic cache file path based on split parameters."""
-        key = f"{self.root_dir}|{split_name}|{self.trainval_ratio}|{self.trainval_seed}|{self.trainval_split_by}"
+        cache_version = "v2_official_eval_gt"
+        deps = [self.train_split_file]
+        if split_name == "evaluation":
+            deps.extend([self.eval_split_file, self.eval_xyz_json, self.eval_verts_json])
+        dep_stats: List[str] = []
+        for path in deps:
+            if path and osp.exists(path):
+                st = os.stat(path)
+                dep_stats.append(f"{path}|{st.st_size}|{st.st_mtime}")
+            else:
+                dep_stats.append(f"{path}|missing")
+        key = f"{cache_version}|{self.root_dir}|{split_name}|{'|'.join(dep_stats)}"
         h = hashlib.md5(key.encode()).hexdigest()[:12]
         return osp.join(self.root_dir, f".cache_ho3d_{split_name}_{h}.pkl")
 
@@ -317,6 +287,10 @@ class HO3DDataset(Dataset):
         split_name = str(self.data_split).lower()
         if split_name == "test":
             split_name = "evaluation"
+        elif split_name == "val":
+            split_name = "evaluation"
+        elif split_name == "train_all":
+            split_name = "train"
 
         # Try loading from cache first.
         cache_file = self._cache_path(split_name)
@@ -345,28 +319,32 @@ class HO3DDataset(Dataset):
         return datalist
 
     def _load_data_from_pickles(self, split_name: str) -> List[Dict[str, Any]]:
-        train_txt = osp.join(self.root_dir, "train.txt")
-        eval_txt = osp.join(self.root_dir, "evaluation.txt")
-
         selected: List[str]
         split_folder: str
-        if split_name in ("train", "val", "train_all"):
-            if not osp.exists(train_txt):
-                raise FileNotFoundError(f"Split file not found: {train_txt}")
-            all_train = self._read_split_lines(train_txt)
-            train_lines, val_lines = self._split_train_lines(all_train)
-            if split_name == "train":
-                selected = train_lines
-            elif split_name == "val":
-                selected = val_lines
-            else:
-                selected = all_train
+        eval_xyz: List[Any] | None = None
+        eval_verts: List[Any] | None = None
+        if split_name == "train":
+            if not osp.exists(self.train_split_file):
+                raise FileNotFoundError(f"Split file not found: {self.train_split_file}")
+            selected = self._read_split_lines(self.train_split_file)
             split_folder = "train"
         elif split_name == "evaluation":
-            if not osp.exists(eval_txt):
-                raise FileNotFoundError(f"Split file not found: {eval_txt}")
-            selected = self._read_split_lines(eval_txt)
+            if not osp.exists(self.eval_split_file):
+                raise FileNotFoundError(f"Split file not found: {self.eval_split_file}")
+            selected = self._read_split_lines(self.eval_split_file)
             split_folder = "evaluation"
+            eval_xyz = self._load_json_list(self.eval_xyz_json, name="evaluation_xyz")
+            eval_verts = self._load_json_list(self.eval_verts_json, name="evaluation_verts")
+            if len(eval_xyz) != len(selected):
+                raise ValueError(
+                    f"HO3D evaluation_xyz.json length mismatch: {len(eval_xyz)} vs {len(selected)} entries in "
+                    f"{self.eval_split_file}"
+                )
+            if len(eval_verts) != len(selected):
+                raise ValueError(
+                    f"HO3D evaluation_verts.json length mismatch: {len(eval_verts)} vs {len(selected)} entries in "
+                    f"{self.eval_split_file}"
+                )
         else:
             raise ValueError(f"Unsupported HO3D split: {self.data_split}")
 
@@ -404,7 +382,8 @@ class HO3DDataset(Dataset):
             is_eval = split_folder == "evaluation"
             if is_eval:
                 bbox = meta.get("handBoundingBox", None)
-                root_joint = meta.get("handJoints3D", None)
+                joints = np.asarray(eval_xyz[i], dtype=np.float32).reshape(21, 3)
+                verts = np.asarray(eval_verts[i], dtype=np.float32).reshape(-1, 3)
                 datalist.append(
                     {
                         "img_path": rgb_path,
@@ -413,7 +392,8 @@ class HO3DDataset(Dataset):
                         "K": K,
                         "is_eval": True,
                         "handBoundingBox": bbox,
-                        "handRoot3D": root_joint,
+                        "joints_coord_cam": joints,
+                        "vertices_cam": verts,
                     }
                 )
                 continue
@@ -461,8 +441,10 @@ class HO3DDataset(Dataset):
         is_eval = bool(data.get("is_eval", False))
         hand_type = "right"
 
-        # Prepare GT (or dummy placeholders for evaluation split).
-        if not is_eval:
+        vertices_gt = None
+
+        # Prepare GT from split-specific annotations.
+        if "joints_coord_cam" in data:
             joints_ho3d = np.asarray(data["joints_coord_cam"], dtype=np.float32).reshape(21, 3)
             joints_std = _ho3d_cam_to_std_xyz(joints_ho3d)
             joints_mano = joints_std[HO3D_META_JOINT_MAP, :]
@@ -478,6 +460,13 @@ class HO3DDataset(Dataset):
                 )
             else:
                 center, scale_px = center_gt, scale_px_gt
+                if np.sum(coord_valid > 0.5) < 2:
+                    bbox = data.get("handBoundingBox", None)
+                    bb = _sanitize_bbox_xyxy(np.array(bbox, dtype=np.float32), w, h) if bbox is not None else None
+                    if bb is not None:
+                        x1, y1, x2, y2 = bb.tolist()
+                        center = np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0], dtype=np.float32)
+                        scale_px = np.array([(x2 - x1) * 1.2, (y2 - y1) * 1.2], dtype=np.float32)
 
             bbox_size = float(scale_px.max())
             denom = float(max(float(scale_px.max()), 1e-6))
@@ -492,47 +481,55 @@ class HO3DDataset(Dataset):
                 center[0] += jitter_x
                 center[1] += jitter_y
 
-            pose = np.asarray(data["mano_pose"], dtype=np.float32).reshape(48)
-            beta = np.asarray(data["mano_shape"], dtype=np.float32).reshape(10)
-            trans = np.asarray(data["mano_trans"], dtype=np.float32).reshape(3)
+            if not is_eval:
+                pose = np.asarray(data["mano_pose"], dtype=np.float32).reshape(48)
+                beta = np.asarray(data["mano_shape"], dtype=np.float32).reshape(10)
+                trans = np.asarray(data["mano_trans"], dtype=np.float32).reshape(3)
 
-            global_orient = _ho3d_cam_to_std_global_orient(pose[:3])
-            hand_pose = pose[3:].copy()
-            mano_shape = beta.copy()
-            mano_trans = _ho3d_cam_to_std_xyz(trans).reshape(3)
+                global_orient = _ho3d_cam_to_std_global_orient(pose[:3])
+                hand_pose = pose[3:].copy()
+                mano_shape = beta.copy()
+                mano_trans = _ho3d_cam_to_std_xyz(trans).reshape(3)
 
-            mano_params = {"global_orient": global_orient, "hand_pose": hand_pose, "betas": mano_shape}
-            has_mano_params = {
-                "global_orient": np.array([1.0], dtype=np.float32),
-                "hand_pose": np.array([1.0], dtype=np.float32),
-                "betas": np.array([1.0], dtype=np.float32),
-            }
+                mano_params = {"global_orient": global_orient, "hand_pose": hand_pose, "betas": mano_shape}
+                has_mano_params = {
+                    "global_orient": np.array([1.0], dtype=np.float32),
+                    "hand_pose": np.array([1.0], dtype=np.float32),
+                    "betas": np.array([1.0], dtype=np.float32),
+                }
+            else:
+                mano_params = {
+                    "global_orient": np.zeros((3,), dtype=np.float32),
+                    "hand_pose": np.zeros((45,), dtype=np.float32),
+                    "betas": np.zeros((10,), dtype=np.float32),
+                }
+                has_mano_params = {
+                    "global_orient": np.array([0.0], dtype=np.float32),
+                    "hand_pose": np.array([0.0], dtype=np.float32),
+                    "betas": np.array([0.0], dtype=np.float32),
+                }
+                mano_trans = np.zeros((3,), dtype=np.float32)
+
+                verts = data.get("vertices_cam", None)
+                if verts is not None:
+                    vertices_gt = _ho3d_cam_to_std_xyz(np.asarray(verts, dtype=np.float32).reshape(-1, 3)).astype(
+                        np.float32
+                    )
         else:
-            # Evaluation meta: bbox is in image coords, and joints are incomplete (root only).
             keypoints_2d = np.zeros((21, 2), dtype=np.float32)
             keypoints_3d = np.zeros((21, 3), dtype=np.float32)
             coord_valid = np.zeros((21,), dtype=np.float32)
-
             if self.bbox_source == "detector":
                 center, scale_px = _bbox_from_detector(
                     self.detector, rgb, w, h, rgb_path, expand_factor=self.detector_bbox_expand
                 )
             else:
-                bbox = data.get("handBoundingBox", None)
-                bb = _sanitize_bbox_xyxy(np.array(bbox, dtype=np.float32), w, h) if bbox is not None else None
-                if bb is not None:
-                    x1, y1, x2, y2 = bb.tolist()
-                    center = np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0], dtype=np.float32)
-                    scale_px = np.array([(x2 - x1) * 1.2, (y2 - y1) * 1.2], dtype=np.float32)
-                else:
-                    center = np.array([w / 2.0, h / 2.0], dtype=np.float32)
-                    scale_px = np.array([float(max(w, h)), float(max(w, h))], dtype=np.float32)
-
+                center = np.array([w / 2.0, h / 2.0], dtype=np.float32)
+                scale_px = np.array([float(max(w, h)), float(max(w, h))], dtype=np.float32)
             bbox_size = float(scale_px.max())
             denom = float(max(float(scale_px.max()), 1e-6))
             bbox_expand_factor = float(bbox_size / denom)
             scale = (scale_px / 200.0).astype(np.float32)
-
             mano_params = {
                 "global_orient": np.zeros((3,), dtype=np.float32),
                 "hand_pose": np.zeros((45,), dtype=np.float32),
@@ -543,7 +540,6 @@ class HO3DDataset(Dataset):
                 "hand_pose": np.array([0.0], dtype=np.float32),
                 "betas": np.array([0.0], dtype=np.float32),
             }
-            mano_shape = mano_params["betas"].copy()
             mano_trans = np.zeros((3,), dtype=np.float32)
 
         flip_perm = list(range(21))
@@ -606,7 +602,7 @@ class HO3DDataset(Dataset):
 
         mano_params_is_axis_angle = {"global_orient": True, "hand_pose": True, "betas": False}
 
-        return {
+        out = {
             "rgb": imgRGB,
             "keypoints_2d": torch.from_numpy(kp2d_norm.astype(np.float32)).float(),
             "keypoints_3d": torch.from_numpy(kp3d_aug.astype(np.float32)).float(),
@@ -630,6 +626,9 @@ class HO3DDataset(Dataset):
             "seq_name": str(data.get("seq_name", "")),
             "frame_id": str(data.get("frame_id", "")),
         }
+        if vertices_gt is not None:
+            out["vertices_gt"] = torch.from_numpy(vertices_gt.astype(np.float32)).float()
+        return out
 
 
 def main():  # pragma: no cover
@@ -667,7 +666,7 @@ def main():  # pragma: no cover
         "--split",
         type=str,
         default="train",
-        choices=["train", "val", "test", "evaluation", "train_all"],
+        choices=["train", "test", "evaluation"],
         help="Dataset split.",
     )
     parser.add_argument("--img-size", type=int, default=256, help="Output image size.")

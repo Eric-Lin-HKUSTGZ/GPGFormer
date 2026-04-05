@@ -133,33 +133,427 @@ python eval.py --config configs/config_ho3d.yaml --ckpt checkpoints/ho3d/gpgform
 
 ```bash
 # FreiHAND
-python /root/code/hand_reconstruction/GPGFormer/infer_to_json.py \
-  --config /root/code/hand_reconstruction/GPGFormer/configs/config_freihand_loss.yaml \
-  --ckpt /root/code/vepfs/GPGFormer/checkpoints/freihand_20260306_loss/freihand/gpgformer_best.pt \
-  --output /root/code/vepfs/GPGFormer/outputs/freihand_20260311/metrics_infer_to_json.json
 
+python /root/code/hand_reconstruction/GPGFormer/infer_to_json.py   --config configs/config_freihand_loss_beta_mesh_target51_recommended_sidetuning.yaml --ckpt /root/code/vepfs/GPGFormer/checkpoints/freihand_loss_beta_mesh_target51_recommended_sidetuning_20260317/freihand/gpgformer_best.pt   --output /root/code/vepfs/GPGFormer/outputs/freihand_20260317/metrics_infer_to_json.json
 
-
-
-# HO3D
-python /root/code/hand_reconstruction/GPGFormer/infer_to_json.py \
-  --config /root/code/hand_reconstruction/GPGFormer/configs/ablations/config_ho3d_multimodal_mask_consistency.yaml \
-  --ckpt /root/code/vepfs/GPGFormer/checkpoints/ablations/ho3d_multimodal_mask_consistency_20260310/ho3d/gpgformer_best.pt \
-  --output /root/code/vepfs/GPGFormer/outputs/ho3d_multimodal_mask_consistency_20260310/metrics_infer_to_json.json
-
-python /root/code/hand_reconstruction/GPGFormer/infer_to_json.py \
-  --config /root/code/hand_reconstruction/GPGFormer/configs/config_ho3d_loss.yaml \
-  --ckpt /root/code/vepfs/GPGFormer/checkpoints/ablations/ho3d_20260307/ho3d/gpgformer_best.pt \
-  --output /root/code/vepfs/GPGFormer/outputs/ho3d_20260307/metrics_infer_to_json.json
+python /root/code/hand_reconstruction/GPGFormer/infer_to_json.py   --config configs/ablations_v2/datasets/config_dexycb.yaml   --ckpt /root/code/vepfs/GPGFormer/checkpoints/ablations_v2/dexycb_20260318/dexycb/gpgformer_best.pt   --output /root/code/vepfs/GPGFormer/outputs/dexycb_20260318/metrics_infer_to_json.json
 
 # Dex-YCB
 python /root/code/hand_reconstruction/GPGFormer/infer_to_json.py \
-  --config /root/code/hand_reconstruction/GPGFormer/configs/config_dexycb.yaml \
-  --ckpt /root/code/vepfs/GPGFormer/checkpoints/dexycb_20260305/dexycb/gpgformer_best.pt \
-  --output /root/code/vepfs/GPGFormer/outputs/dexycb_20260305/metrics_infer_to_json.json
+  --config configs/ablations_v2/datasets/config_dexycb.yaml \
+  --ckpt /root/code/vepfs/GPGFormer/checkpoints/ablations_v2/dexycb_20260318/dexycb/gpgformer_best.pt \
+  --output /root/code/vepfs/GPGFormer/outputs/dexycb_20260318/metrics_infer_to_json.json
 ```
 
 ### Hand reconstruction visualization
+
+Cross-method comparison visualization (`visualization/compare_hand_mesh.py`) was verified in the Conda environment `/root/code/vepfs/miniconda3/envs/hamba`.
+
+If you want to enable the `simplehand` branch in this script, make sure `hiera-transformer` is installed in that environment:
+
+```bash
+/root/code/vepfs/miniconda3/envs/hamba/bin/pip install hiera-transformer
+```
+
+The script can be run directly from the GPGFormer repo root:
+
+```bash
+cd /root/code/hand_reconstruction/GPGFormer
+```
+
+Tested commands:
+使用hamba的conda环境
+```bash
+CUDA_VISIBLE_DEVICES=0 python visualization/compare_hand_mesh.py \
+  --dataset freihand \
+  --index 0 \
+  --save-individual \
+  --device cuda:0 \
+  --out-dir /root/code/vepfs/GPGFormer/outputs/compare_hand_mesh_tests/freihand_fixed
+
+CUDA_VISIBLE_DEVICES=0 python visualization/compare_hand_mesh.py \
+  --dataset dexycb \
+  --index 0 \
+  --save-individual \
+  --device cuda:0 \
+  --gpgformer-ckpt /root/code/vepfs/GPGFormer/checkpoints/ablations_v2/dexycb_20260318/dexycb/gpgformer_best.pt \
+  --out-dir /root/code/vepfs/GPGFormer/outputs/compare_hand_mesh_tests/dexycb_fixed
+
+CUDA_VISIBLE_DEVICES=0 python visualization/compare_hand_mesh.py \
+  --dataset ho3d \
+  --index 0 \
+  --save-individual \
+  --device cuda:0 \
+  --gpgformer-ckpt /root/code/vepfs/GPGFormer/checkpoints/ablations_v2/mixed_ho3d_20260320/ho3d/gpgformer_best.pt \
+  --out-dir /root/code/vepfs/GPGFormer/outputs/compare_hand_mesh_tests/ho3d_fixed
+
+# 通过index-range实现批量可视化
+CUDA_VISIBLE_DEVICES=0 python visualization/compare_hand_mesh.py \
+  --dataset freihand \
+  --index-range 50 100 \
+  --save-individual \
+  --device cuda:0 \
+  --out-dir /root/code/vepfs/GPGFormer/outputs/compare_hand_mesh_tests/freihand_range_50_100
+
+# 只保留GPGFormer明显优于另外三个方法的样本，并把mesh-only图切到更容易看出差异的斜视角
+CUDA_VISIBLE_DEVICES=0 python visualization/compare_hand_mesh.py \
+  --dataset freihand \
+  --index-range 0 500 \
+  --show-gpgformer-better \
+  --gpgformer-better-margin-mm 0.3 \
+  --mesh-view-azim 45 \
+  --mesh-view-elev -25 \
+  --save-individual \
+  --device cuda:0 \
+  --out-dir /root/code/vepfs/GPGFormer/outputs/compare_hand_mesh_tests/freihand_gpgformer_better
+
+  CUDA_VISIBLE_DEVICES=0 python visualization/compare_hand_mesh.py \
+  --dataset dexycb \
+  --index-range 4000 5000 \
+  --show-gpgformer-better \
+  --gpgformer-better-margin-mm 1.0 \
+  --mesh-view-azim 45 \
+  --mesh-view-elev -25 \
+  --save-individual \
+  --device cuda:0 \
+  --gpgformer-ckpt /root/code/vepfs/GPGFormer/checkpoints/ablations_v2/dexycb_20260318/dexycb/gpgformer_best.pt 
+  --out-dir /root/code/vepfs/GPGFormer/outputs/compare_hand_mesh_tests/dexycb_gpgformer_better
+
+```
+
+Outputs from the tested runs were written to:
+
+- `/tmp/compare_hand_mesh_tests/freihand_fixed`
+- `/tmp/compare_hand_mesh_tests/dexycb_fixed`
+- `/tmp/compare_hand_mesh_tests/ho3d_fixed`
+
+If you omit `--out-dir`, the script writes to `outputs/compare_hand_meshes/<dataset>/` under the GPGFormer repo.
+
+Each run writes:
+
+- one subdirectory per sample index: `index_000050/`, `index_000051/`, ...
+- one raw full image per sample: `index_000050/index_000050_image.png`
+- one overview panel per sample: `index_000050/index_000050_overview.png`
+- per-method overlay images such as `index_000050/index_000050_wilor_overlay.png`
+- per-method mesh-only images such as `index_000050/index_000050_hamer_mesh.png`
+- a root-level `summary.json` with per-sample status, recovered camera translations, and root-relative metrics (`joint_rr_mm`, `vertex_rr_mm`, `score_mm`)
+
+Index selection options:
+
+- `--index 7`: only visualize index 7
+- `--indices 7 11 25`: visualize a manual index list
+- `--index-range 50 100`: visualize the half-open interval `[50, 100)`, i.e. indices `50..99` for a total of 50 samples
+- `--num-samples N`: default fallback when no explicit index selector is given
+
+Quality-focused selection options:
+
+- `--show-gpgformer-better`: only keep samples where GPGFormer is better than WiLoR / HaMeR / SimpleHand
+- `--gpgformer-better-margin-mm 10`: require GPGFormer to beat all three competitors by at least 10 mm on both root-relative joint error and combined score
+- Current selection metric uses `root_index=9`
+- `joint_rr_mm`: mean joint error in mm after subtracting the root joint
+- `vertex_rr_mm`: mean mesh vertex error in mm after subtracting the root joint
+- `score_mm`: mean of available root-relative errors, currently averaging `joint_rr_mm` and `vertex_rr_mm`
+
+Mesh-only view options:
+
+- `--mesh-view-azim 45`
+- `--mesh-view-elev -25`
+
+These options only affect mesh-only renders, not overlay renders, and are useful when the original camera view hides shape differences.
+
+### FreiHAND feature map comparison visualization
+
+`/root/code/vepfs/GPGFormer/tools/visualize_freihand_feature_comparison.py` 用于在 FreiHAND 上对比单 RGB 与双模态 GPGFormer 的特征响应，帮助分析加入几何分支后，模型是否更聚焦于手部区域。
+
+当前脚本会同时导出三类可视化：
+
+- WiLoR backbone 中间层 self-attention rollout，默认第 `4 / 8 / 12` 层
+- `img_feat` 空间激活图，默认对通道做 `L2 norm`
+- `SJTA` 关节 query cross-attention，默认可视化 `thumb_tip` 和 `middle_mcp`
+
+默认对比的两个 checkpoint：
+
+- RGB-only:
+  - `/root/code/vepfs/GPGFormer/checkpoints/freihand_20260304_rgb_only/freihand/gpgformer_best.pt`
+- Multimodal:
+  - `/root/code/vepfs/GPGFormer/checkpoints/freihand_loss_beta_mesh_target51_recommended_sidetuning_20260317/freihand/gpgformer_best.pt`
+
+运行环境：
+
+- 推荐使用 `/root/code/vepfs/miniconda3/envs/moge`
+
+示例命令：
+
+```bash
+/root/code/vepfs/miniconda3/envs/moge/bin/python \
+  /root/code/vepfs/GPGFormer/tools/visualize_freihand_feature_comparison.py \
+  --device cuda:0 \
+  --split eval \
+  --num-samples 8 \
+  --layers 4 8 12 \
+  --joint-names thumb_tip middle_mcp \
+  --output-dir /root/code/vepfs/GPGFormer/outputs/freihand_feature_compare_run
+```
+
+如需额外把 GT hand bbox 画到叠加图上，可显式加上 `--show-bbox`：
+
+```bash
+/root/code/vepfs/miniconda3/envs/moge/bin/python \
+  /root/code/vepfs/GPGFormer/tools/visualize_freihand_feature_comparison.py \
+  --device cuda:0 \
+  --split eval \
+  --num-samples 8 \
+  --layers 4 8 12 \
+  --joint-names thumb_tip middle_mcp \
+  --show-bbox \
+  --output-dir /root/code/vepfs/GPGFormer/outputs/freihand_feature_compare_run_bbox
+```
+
+常用参数：
+
+- `--sample-indices 0 5 12`：只跑指定样本
+- `--num-samples 8`：当未指定样本索引时，抽取若干样本
+- `--layers 4 8 12`：设置 rollout 层号
+- `--joint-names thumb_tip middle_mcp`：设置 SJTA 可视化关节
+- `--img-feat-reducer l2|var`：设置 `img_feat` 压缩方式
+- `--cmap viridis`
+- `--alpha 0.55`
+- `--show-bbox`：可选地在导出的 overlay 和 overview 图中绘制白色 GT hand bbox，默认关闭
+
+输出目录结构：
+
+- 根目录下会写出 `summary.json`
+- 每个样本一个子目录：`sample_<dataset_idx>_img_<real_idx>/`
+- 每个样本目录下包含：
+  - `input_crop.png`
+  - `overview.png`
+  - `metadata.json`
+  - `rgb_only/`
+  - `multimodal/`
+- 模型子目录下会写出：
+  - `img_feat_<reducer>.png`
+  - `rollout_layer_04.png` / `rollout_layer_08.png` / `rollout_layer_12.png`
+  - `sjta_thumb_tip.png`
+  - `sjta_middle_mcp.png`
+
+说明：
+
+- 叠加图是画在模型输入 crop 上，不是回贴到原始整图；这样与 token/grid 特征是一一对应的。
+- `summary.json` 与每个样本的 `metadata.json` 会记录一些简单的定量指标，例如热图在手部 GT bbox 内的质量占比、SJTA 峰值到 GT 关节的像素距离等。
+- 白色 bbox、红色点、蓝绿色叉号以及 `inside-bbox` / `peak-to-gt` / `pred-to-gt` 的含义与优劣方向，现在只保留在脚本代码注释中说明，不再额外绘制在图面上。
+- RGB-only checkpoint 加载时可能提示缺少 `encoder.sum_geo_gate`；这是因为该模型 `use_geo_prior=False`，该参数不参与实际前向，不影响可视化结果。
+
+### Multi-dataset token analysis visualization
+
+`/root/code/vepfs/GPGFormer/tools/visualize_freihand_token_analysis.py` 现在支持 `freihand`、`ho3d` 和 `dexycb` 三个数据集，用来直接分析 GPGFormer 在 token 流中的五个关键阶段。
+
+当前脚本会保留以下五类原始 energy heatmap：
+
+- `RGB patch tokens`：RGB 图像经过 `patch_embed` 后、进入融合前的 token 热图
+- `Geometry tokens`：几何分支变成 token 后的热图
+- `Fusion before backbone`：RGB token 与几何 token 融合后、进入 backbone block 0 之前的热图
+- `Backbone last layer (multimodal)`：双模态条件下 backbone 最后一层输出热图
+- `Backbone last layer (RGB-only)`：单 RGB 条件下 backbone 最后一层输出热图
+
+同时还会额外导出一组更适合论文分析的 semantic / complementarity heatmap：
+
+- `Cross-modal cosine distance`：看 Geometry token 与 RGB token 在哪里最不一致、最互补
+- `RGB-hand similarity`：看 RGB patch token 与最终手部语义原型的相似度
+- `Geometry-hand similarity`：看 Geometry token 与最终手部语义原型的相似度
+- `Fusion-hand similarity`：看融合后 token 与最终手部语义原型的相似度
+- `Fusion gain over best single`：看融合后 token 相比 `max(RGB, Geometry)` 的额外增益
+- `Final multimodal-hand similarity` / `Final RGB-only-hand similarity`：看深层语义表征与手部原型的对齐程度
+- `Final multimodal gain`：看双模态最终表征相比 RGB-only 的提升区域
+
+其中第二类 `Geometry tokens` 可视化的是“真正送进 encoder 的几何 token”，也就是：
+
+- `MoGe2 -> GeoSideAdapter(若启用) -> GeoTokenizer -> GeoSideTuning(若启用)` 之后的结果
+
+运行环境：
+
+- 推荐使用 `/root/code/vepfs/miniconda3/envs/moge`
+
+FreiHAND 示例：
+
+```bash
+/root/code/vepfs/miniconda3/envs/moge/bin/python \
+  /root/code/vepfs/GPGFormer/tools/visualize_freihand_token_analysis.py \
+  --dataset freihand \
+  --checkpoint /root/code/vepfs/GPGFormer/checkpoints/freihand_loss_beta_mesh_target51_recommended_sidetuning_20260317/freihand/gpgformer_best.pt \
+  --rgb-checkpoint /root/code/vepfs/GPGFormer/checkpoints/freihand_20260304_rgb_only/freihand/gpgformer_best.pt \
+  --device cuda:0 \
+  --split eval \
+  --num-samples 8 \
+  --heatmap-reducer l2 \
+  --heatmap-cmap jet \
+  --output-dir /root/code/vepfs/GPGFormer/outputs/freihand_token_heatmap_run
+```
+
+HO3D 示例：
+
+```bash
+/root/code/vepfs/miniconda3/envs/moge/bin/python \
+  /root/code/vepfs/GPGFormer/tools/visualize_freihand_token_analysis.py \
+  --dataset ho3d \
+  --checkpoint /root/code/vepfs/GPGFormer/checkpoints/ablations_v2/ho3d_20260319/ho3d/gpgformer_best.pt \
+  --device cuda:0 \
+  --split eval \
+  --num-samples 8 \
+  --output-dir /root/code/vepfs/GPGFormer/outputs/ho3d_token_heatmap_run
+```
+
+Dex-YCB 示例：
+
+```bash
+/root/code/vepfs/miniconda3/envs/moge/bin/python \
+  /root/code/vepfs/GPGFormer/tools/visualize_freihand_token_analysis.py \
+  --dataset dexycb \
+  --checkpoint /root/code/vepfs/GPGFormer/checkpoints/ablations_v2/dexycb_20260318/dexycb/gpgformer_best.pt \
+  --device cuda:0 \
+  --split eval \
+  --num-samples 8 \
+  --output-dir /root/code/vepfs/GPGFormer/outputs/dexycb_token_heatmap_run
+```
+
+如需额外把 GT hand bbox 画在 overview 和 overlay 图上：
+
+```bash
+/root/code/vepfs/miniconda3/envs/moge/bin/python \
+  /root/code/vepfs/GPGFormer/tools/visualize_freihand_token_analysis.py \
+  --dataset freihand \
+  --split eval \
+  --sample-indices 0 12 58 \
+  --show-bbox \
+  --output-dir /root/code/vepfs/GPGFormer/outputs/freihand_token_heatmap_bbox
+```
+
+常用参数：
+
+- `--dataset freihand|ho3d|dexycb`：选择数据集
+- `--checkpoint <path>`：指定双模态 checkpoint；若不传，脚本会使用内置默认路径
+- `--rgb-checkpoint <path>`：可选的单 RGB checkpoint；若不传，则脚本会复用双模态 checkpoint，并在前向时关闭几何分支得到 RGB-only heatmap
+- `--sample-indices 0 5 12`：只跑指定样本
+- `--num-samples 8`：当未指定样本索引时，非训练 split 默认取前 `N` 个样本，`train` 按随机种子采样
+- `--heatmap-reducer l2|l1|var`：设置通道压缩方式；`l2` 最常用
+- `--heatmap-cmap jet|viridis|magma|turbo`：设置伪彩色风格
+- `--overlay-alpha 0.58`：控制热图与暗化输入图的叠加强度
+- `--darken-factor 0.38`：控制输入底图变暗程度
+- `--show-bbox`：可选地绘制白色 GT hand bbox，默认关闭
+
+输出目录结构：
+
+- 根目录下会写出 `summary.json`
+- 每个样本一个子目录：`sample_<dataset_idx>_<sample_id>/`
+- 每个样本目录下包含：
+  - `input_crop.png`
+  - `input_dark.png`
+  - `input_crop_with_bbox.png`（仅当传入 `--show-bbox` 时导出）
+  - `hand_region_mask_preview.png`
+  - `overview_energy.png`
+  - `overview_semantic.png`
+  - `overview.png`（默认与 `overview_semantic.png` 相同，便于快速查看）
+  - `metadata.json`
+  - `rgb_patch_heatmap.png` / `rgb_patch_overlay.png`
+  - `geo_tokens_heatmap.png` / `geo_tokens_overlay.png`
+  - `fused_pre_backbone_heatmap.png` / `fused_pre_backbone_overlay.png`
+  - `backbone_last_multimodal_heatmap.png` / `backbone_last_multimodal_overlay.png`
+  - `backbone_last_rgb_only_heatmap.png` / `backbone_last_rgb_only_overlay.png`
+  - `cross_modal_cosine_distance_heatmap.png` / `cross_modal_cosine_distance_overlay.png`
+  - `rgb_hand_similarity_heatmap.png` / `rgb_hand_similarity_overlay.png`
+  - `geo_hand_similarity_heatmap.png` / `geo_hand_similarity_overlay.png`
+  - `fused_hand_similarity_heatmap.png` / `fused_hand_similarity_overlay.png`
+  - `fusion_gain_over_best_heatmap.png` / `fusion_gain_over_best_overlay.png`
+  - `backbone_last_multimodal_similarity_heatmap.png` / `backbone_last_multimodal_similarity_overlay.png`
+  - `backbone_last_rgb_only_similarity_heatmap.png` / `backbone_last_rgb_only_similarity_overlay.png`
+  - `backbone_last_multimodal_gain_heatmap.png` / `backbone_last_multimodal_gain_overlay.png`
+
+说明：
+
+- 所有 overlay 都画在模型输入 crop 上，不回贴原始整图，这样与 token 网格是一一对应的。
+- 脚本会先根据 2D 关节构建一个 `convex hull + dilation` 的近似手部区域，而不是只用粗 bbox。这样可以更稳定地判断热图是否真的落在手上。
+- `metadata.json` 和 `summary.json` 中会记录每类热图的 `inside_hand_mass`、`inside_outside_gap`、`top10_inside_ratio`、`peak_xy` 和 `peak_value`。
+- `inside_hand_mass` 表示热图正响应中落在近似手部区域内的比例，越大越好。
+- `top10_inside_ratio` 表示热图最强的前 10% 响应中有多少落在手部区域内，越大越好。
+- `overview_energy.png` 用来诊断原始 token 能量分布。早期 energy map 经常会对背景纹理、强边缘和光照变化敏感，所以不要直接把它们当作“模型是否关注手”的证据。
+- `overview_semantic.png` 才是更推荐的分析视图：它把“token 是否和最终手部语义一致”“Geometry 和 RGB 是否互补”“Fusion 是否带来额外收益”直接可视化出来。
+- `Cross-modal cosine distance` 最适合找阴影、自遮挡和边界这些 RGB 歧义区域。
+- `Fusion gain over best single` 最适合证明融合后 token 不只是折中，而是在困难区域超越了单独的 RGB / Geometry token。
+- `Backbone last layer (multimodal)` 与 `Backbone last layer (RGB-only)` 以及对应的 similarity / gain 图，最适合做最终结论，判断双模态是否在深层表征中更稳定地对齐手部语义。
+- 对于 HO3D 和 Dex-YCB，如果没有单独的 RGB-only checkpoint，脚本会自动退化为“同一个双模态模型、但关闭几何输入”的 RGB-only 视图，这样三套数据集都能统一跑通。
+
+### Export RGB + depth by dataset index
+
+`visualization/export_rgb_depth_by_index.py` 用于按数据集索引导出某个样本对应的原始 RGB 图和深度图，便于快速核对原始输入。
+
+当前支持：
+
+- `dexycb`
+- `ho3d`
+
+脚本会自动：
+
+- 根据 `--dataset` 和 `--index` 定位样本
+- 导出 `rgb.png`
+- 导出原始深度图 `depth_raw.png`
+- 导出解码后的深度可视化 `depth_decoded_vis.png`
+- 导出样本元信息 `meta.json`
+
+默认输出目录格式：
+
+- `/root/code/vepfs/GPGFormer/outputs/rgb_depth_by_index/<dataset>_<split>_idx_<index>/`
+
+说明：
+
+- DexYCB 默认 `--split test`，并支持 `--setup`，默认是 `s0`
+- HO3D 默认 `--split evaluation`
+- 脚本内部使用 `bbox_source='gt'` 和 `align_wilor_aug=False`，只做原始样本定位与导出，不做训练时的数据增强
+- HO3D 会额外把官方深度 PNG 解码成可视化灰度图保存到 `depth_decoded_vis.png`
+
+运行前先进入仓库根目录：
+
+```bash
+cd /root/code/hand_reconstruction/GPGFormer
+```
+
+示例命令：
+
+```bash
+# DexYCB: 导出 test split 的第 0 个样本
+python visualization/export_rgb_depth_by_index.py \
+  --dataset dexycb \
+  --index 0
+
+# DexYCB: 指定 setup、split 和输出目录
+python visualization/export_rgb_depth_by_index.py \
+  --dataset dexycb \
+  --setup s0 \
+  --split test \
+  --index 42 \
+  --output-root /root/code/vepfs/GPGFormer/outputs
+
+# HO3D: 导出 evaluation split 的第 0 个样本
+python visualization/export_rgb_depth_by_index.py \
+  --dataset ho3d \
+  --index 0
+
+# HO3D: 指定数据根目录和输出目录
+python visualization/export_rgb_depth_by_index.py \
+  --dataset ho3d \
+  --split evaluation \
+  --index 15 \
+  --ho3d-root /root/code/vepfs/dataset/HO3D_v3 \
+  --output-root /root/code/vepfs/GPGFormer/outputs
+```
+
+常用参数：
+
+- `--dataset {dexycb,ho3d}`
+- `--index <int>`
+- `--split <name>`
+- `--setup <name>`：仅 DexYCB 使用
+- `--dexycb-root <path>`
+- `--ho3d-root <path>`
+- `--output-root <path>`
 
 Run visualization with a checkpoint (if checkpoint contains `cfg`, you can omit `--config`):
 
@@ -202,6 +596,7 @@ python visualize_reconstruction.py \
   --render-mesh \
   --num-samples 24 \
   --batch-size 8
+
 ```
 
 If your target output path is on a quota-limited filesystem (e.g. `/root/code/vepfs/...`) and you see `OSError: [Errno 122] Disk quota exceeded`, either choose a different `--out-dir` or set `--fallback-out-dir`.

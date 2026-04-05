@@ -1,0 +1,207 @@
+dataset:
+  # Primary dataset for validation/evaluation. Use train_mixed.py for mixed training.
+  name: ho3d
+  img_size: 256
+  root_index: 9
+  ho3d_version: v3
+  align_wilor_aug: true
+  # HO3D eval in this repo uses label-based crop.
+  bbox_source_eval: gt
+  wilor_aug_config:
+    SCALE_FACTOR: 0.3
+    ROT_FACTOR: 30
+    TRANS_FACTOR: 0.02
+    COLOR_SCALE: 0.2
+    ROT_AUG_RATE: 0.6
+    TRANS_AUG_RATE: 0.5
+    DO_FLIP: false
+    FLIP_AUG_RATE: 0.0
+    EXTREME_CROP_AUG_RATE: 0.0
+    EXTREME_CROP_AUG_LEVEL: 1
+
+  # Mixed training datasets consumed by train_mixed.py.
+  # Current mixed_ho3d already outperforms the HO3D-only runs early, so we only
+  # bias the sampler a bit more toward HO3D instead of making a large change.
+  mixed_datasets:
+    - name: freihand
+      weight: 0.9
+      use_trainval_split: true
+      trainval_ratio: 0.9
+      trainval_seed: 42
+    - name: ho3d
+      weight: 1.0
+      ho3d_version: v3
+    - name: dexycb
+      weight: 0.3
+      dexycb_setup: s0
+
+paths:
+  freihand_root: /root/code/vepfs/dataset/FreiHAND_pub_v2
+  freihand_eval_root: /root/code/vepfs/dataset/FreiHAND_pub_v2_eval
+  ho3d_root: /root/code/vepfs/dataset/HO3D_v3
+  ho3d_train_split_file: /root/code/vepfs/dataset/HO3D_v3/train.txt
+  ho3d_eval_split_file: /root/code/vepfs/dataset/HO3D_v3/evaluation.txt
+  ho3d_eval_xyz_json: /root/code/vepfs/dataset/HO3D_v3/evaluation_xyz.json
+  ho3d_eval_verts_json: /root/code/vepfs/dataset/HO3D_v3/evaluation_verts.json
+  dexycb_root: /root/code/vepfs/dataset/dex-ycb
+  wilor_ckpt: /root/code/vepfs/GPGFormer/weights/wilor_final.ckpt
+  detector_ckpt: /root/code/vepfs/GPGFormer/weights/detector.pt
+  moge2_ckpt: /root/code/vepfs/GPGFormer/weights/model.pt
+  mano_dir: /root/code/vepfs/GPGFormer/weights/mano
+  mano_mean_params: /root/code/vepfs/GPGFormer/weights/mano/mano_mean_params.npz
+
+model:
+  backbone_type: wilor
+  image_size: 256
+  focal_length: 5000
+  use_geo_prior: true
+  moge2_num_tokens: 400
+  moge2_output: neck
+  token_fusion_mode: sum
+  sum_fusion_strategy: channel_concat
+  # Start slightly more RGB-dominant than the current mixed file so late
+  # training does not chase geometry/mesh losses at the expense of PA-MPJPE.
+  sum_geo_gate_init: -1.3
+  fusion_proj_zero_init: true
+  geo_branch_dropout_prob: 0.05
+  cross_attn_num_heads: 8
+  cross_attn_dropout: 0.0
+  cross_attn_gate_init: 0.0
+  side_tuning:
+    enabled: false
+    side_channels: 256
+    dropout: 0.05
+    max_res_scale: 0.1
+    init_res_scale: 0.001
+  geo_side_adapter:
+    enabled: true
+    side_channels: 128
+    depth: 2
+    dropout: 0.05
+    norm_groups: 32
+  geo_tokenizer_use_pooling: true
+  mano_decoder: wilor
+  freihand_mano_root: /root/code/hand_reconstruction/freihand/data
+  mano_head:
+    ief_iters: 3
+    transformer_input: mean_shape
+    dim: 1024
+    depth: 6
+    heads: 8
+    dim_head: 64
+    mlp_dim: 2048
+    dropout: 0.0
+  feature_refiner:
+    method: sjta
+    feat_dim: 1280
+    sjta_bottleneck_dim: 256
+    sjta_num_heads: 4
+    sjta_use_2d_prior: true
+    sjta_num_steps: 2
+    coear_dilation1: 1
+    coear_dilation2: 2
+    coear_gate_reduction: 8
+    coear_init_alpha: 0.1
+    wilor_msf_bottleneck_ratio: 4
+    wilor_msf_dilation1: 1
+    wilor_msf_dilation2: 2
+    wilor_msf_dilation3: 3
+    wilor_msf_gate_reduction: 8
+    wilor_msf_init_alpha: 0.1
+    kcr_num_keypoints: 21
+    kcr_hidden_dim: 128
+
+loss:
+  reduction: mean
+  w_2d: 1.0
+  w_kcr_2d: 1.0
+  # Keep the validated mixed_ho3d loss weights unchanged.
+  w_3d_joint: 5.0
+  w_bone_length: 1.0
+  joint_3d_tip_weight: 2.5
+  tip_joint_indices: [4, 8, 12, 16, 20]
+  bone_pairs:
+    - [0, 1]
+    - [1, 2]
+    - [2, 3]
+    - [3, 4]
+    - [0, 5]
+    - [5, 6]
+    - [6, 7]
+    - [7, 8]
+    - [0, 9]
+    - [9, 10]
+    - [10, 11]
+    - [11, 12]
+    - [0, 13]
+    - [13, 14]
+    - [14, 15]
+    - [15, 16]
+    - [0, 17]
+    - [17, 18]
+    - [18, 19]
+    - [19, 20]
+  w_3d_vert: 0.10
+  w_global_orient: 0.4
+  w_hand_pose: 0.4
+  w_scale: 0.0
+  w_betas: 0.01
+  w_shape: 0.05
+  mano_param_loss_type: smooth_l1
+  mano_param_smooth_l1_beta: 0.05
+  mano_param_per_sample_clip: 1.0
+
+train:
+  use_cuda: true
+  # In the mixed run, epoch 21 was already the best point and later epochs only
+  # lowered train loss without improving HO3D validation. Shorten the schedule
+  # and compress the ramps instead of repeating the long low-LR tail.
+  epochs: 28
+  batch_size: 64
+  val_batch_size: 64
+  lr: 2e-5
+  weight_decay: 1e-4
+  lr_multiplier:
+    backbone: 0.5
+    head: 2.1
+    geo_fusion: 0.25
+    side_tuning: 0.8
+  warmup_epochs: 6
+  geo_fusion_start_factor: 0.05
+  geo_fusion_ramp_epochs: 14
+  side_tuning_start_factor: 0.1
+  side_tuning_ramp_epochs: 10
+  min_lr: 5e-7
+  seed: 42
+
+  rgb_token_mask:
+    enabled: false
+    apply_to_main_forward: false
+    apply_prob: 0.0
+    ratio_start: 0.0
+    ratio_end: 0.0
+    ramp_epochs: 0
+    mode: block
+    fill: zero
+
+  consistency:
+    enabled: false
+    w_3d: 0.0
+    w_mesh: 0.0
+    start_factor: 1.0
+    ramp_epochs: 0
+    max_samples: 0
+
+  grad_clip_norm: 1.0
+  use_ema: false
+  ema_decay: 0.9998
+  eval_train_metrics: false
+  num_workers: 32
+  # Save directly by the target metric, because joint_mesh selection prefers an
+  # even smaller average and kept missing the best PA-MPJPE checkpoint.
+  best_ckpt_metric: pa_mpjpe
+  deterministic: true
+  out_dir: /root/code/vepfs/GPGFormer/checkpoints/ablations_v2/mixed_ho3d_target67_20260322
+
+metrics:
+  mesh_fallback_kp_consistency_thr_mm: 40.0

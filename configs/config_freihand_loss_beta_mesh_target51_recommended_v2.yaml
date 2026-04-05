@@ -8,7 +8,7 @@ dataset:
   align_wilor_aug: true
   bbox_source_eval: detector
   wilor_aug_config:
-    SCALE_FACTOR: 0.3 
+    SCALE_FACTOR: 0.3
     ROT_FACTOR: 30
     TRANS_FACTOR: 0.02
     COLOR_SCALE: 0.2
@@ -38,9 +38,12 @@ model:
   moge2_output: neck
   token_fusion_mode: sum
   sum_fusion_strategy: channel_concat
-  sum_geo_gate_init: -1.2
+  # Start slightly more RGB-dominant than recommended so we keep the strong
+  # joint behavior of the rgb-only baseline while still allowing geometry in later.
+  sum_geo_gate_init: -1.3
   fusion_proj_zero_init: true
-  geo_branch_dropout_prob: 0.10
+  # Increase geo dropout a touch to reduce mid-training over-reliance on geometry.
+  geo_branch_dropout_prob: 0.05
   cross_attn_num_heads: 8
   cross_attn_dropout: 0.0
   cross_attn_gate_init: 0.0
@@ -86,9 +89,11 @@ loss:
   reduction: mean
   w_2d: 1.0
   w_kcr_2d: 1.0
-  w_3d_joint: 5.0
-  w_bone_length: 1.0
-  joint_3d_tip_weight: 2.5
+  # Pull slightly harder on joints than recommended, but stay well away from
+  # the unstable heavy-target setting.
+  w_3d_joint: 5.2
+  w_bone_length: 1.1
+  joint_3d_tip_weight: 2.7
   tip_joint_indices: [4, 8, 12, 16, 20]
   bone_pairs:
     - [0, 1]
@@ -111,28 +116,32 @@ loss:
     - [17, 18]
     - [18, 19]
     - [19, 20]
-  
-  w_3d_vert: 0.5
-  w_global_orient: 0.5
-  w_hand_pose: 0.5
-  w_shape: 0.05
+  # Trim mesh weight slightly so optimization stays joint-first.
+  w_3d_vert: 0.09
+  w_global_orient: 0.4
+  w_hand_pose: 0.4
   w_scale: 0.0
-  
+  # Keep direct beta supervision, but relax pure shape regularization a bit to
+  # reduce the mid-training tug-of-war seen in the recommended run.
+  w_betas: 0.015
+  w_shape: 0.045
   mano_param_loss_type: smooth_l1
   mano_param_smooth_l1_beta: 0.05
   mano_param_per_sample_clip: 1.0
 
 train:
   use_cuda: true
-  epochs: 50
+  # Keep the recommended 60-epoch schedule because it kept improving late.
+  epochs: 60
   batch_size: 96
   val_batch_size: 96
   lr: 2e-5
   weight_decay: 1e-4
   lr_multiplier:
     backbone: 0.5
-    # 【进阶推进】解码头学习率乘子设定为 2.5，兼顾稳定与高速收敛
-    head: 2.5
+    # A very small head boost is enough; midreg_fix_v2 showed that schedule
+    # changes mattered more than pushing the head too hard.
+    head: 2.1
     geo_fusion: 0.25
     side_tuning: 0.8
   warmup_epochs: 8
@@ -144,30 +153,31 @@ train:
   seed: 42
 
   rgb_token_mask:
-    enabled: true
+    enabled: false
     apply_to_main_forward: false
-    apply_prob: 0.60
+    apply_prob: 0.0
     ratio_start: 0.0
-    ratio_end: 0.10
-    ramp_epochs: 20
+    ratio_end: 0.0
+    ramp_epochs: 0
     mode: block
     fill: zero
 
   consistency:
-    enabled: true
-    w_3d: 0.8
-    w_mesh: 0.2
-    start_factor: 0.20
-    ramp_epochs: 12
-    max_samples: 16
+    enabled: false
+    w_3d: 0.0
+    w_mesh: 0.0
+    start_factor: 1.0
+    ramp_epochs: 0
+    max_samples: 0
 
   grad_clip_norm: 1.0
   use_ema: false
   ema_decay: 0.9998
   eval_train_metrics: false
   num_workers: 32
-  # 更新了输出目录，方便你区分 2.0 和 2.5 的 checkpoints
-  out_dir: /root/code/vepfs/GPGFormer/checkpoints/freihand_golden_v3_lr2.5_20260313
+  # If the main target is PA-MPJPE, save checkpoints directly by that metric.
+  best_ckpt_metric: pa_mpjpe
+  out_dir: /root/code/vepfs/GPGFormer/checkpoints/freihand_loss_beta_mesh_target51_recommended_v2_20260315
 
 metrics:
   mesh_fallback_kp_consistency_thr_mm: 40.0

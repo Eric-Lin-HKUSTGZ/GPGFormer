@@ -4,20 +4,6 @@ dataset:
   # Root joint index used for all root-relative ops (loss/eval). Default: 9 (middle MCP).
   root_index: 9
   ho3d_version: v3
-  # Split train.txt into train/val for metrics (HO3D evaluation split often lacks full GT joints)
-  ho3d_val_split: val
-  ho3d_eval_split: val
-  ho3d_trainval_ratio: 0.9
-  ho3d_trainval_seed: 42
-  ho3d_trainval_split_by: sequence  # sequence | frame
-  # Use JSON split files instead of train.txt/evaluation.txt + per-frame meta pkl.
-  ho3d_use_json_split: true
-  # JSON keypoints_3d unit handling for HO3DJsonDataset: auto | m | mm
-  ho3d_json_kp3d_unit: auto
-  # Extra multiplier after unit conversion.
-  ho3d_json_kp3d_scale: 1.0
-  # Optional coordinate conversion (x,y,z)->(x,-y,-z).
-  ho3d_json_convert_xyz: false
   align_wilor_aug: true
   # HO3D has labels for cropping (train/val: joints+K, evaluation/test: handBoundingBox).
   # Keep this label-based and do not use a detector model.
@@ -36,9 +22,10 @@ dataset:
 
 paths:
   ho3d_root: /root/code/vepfs/dataset/HO3D_v3
-  # Optional HO3D JSON split files for HO3DJsonDataset.
-  ho3d_train_json: /c20250503/lwq/dataset/handos_data/HO3Dv3/HO3D-train-normalized.json
-  ho3d_test_json: /c20250503/lwq/dataset/handos_data/HO3Dv3/HO3D-evaluation-meter.json
+  ho3d_train_split_file: /root/code/vepfs/dataset/HO3D_v3/train.txt
+  ho3d_eval_split_file: /root/code/vepfs/dataset/HO3D_v3/evaluation.txt
+  ho3d_eval_xyz_json: /root/code/vepfs/dataset/HO3D_v3/evaluation_xyz.json
+  ho3d_eval_verts_json: /root/code/vepfs/dataset/HO3D_v3/evaluation_verts.json
   wilor_ckpt: /root/code/vepfs/GPGFormer/weights/wilor_final.ckpt
   detector_ckpt: /root/code/vepfs/GPGFormer/weights/detector.pt
   moge2_ckpt: /root/code/vepfs/GPGFormer/weights/model.pt

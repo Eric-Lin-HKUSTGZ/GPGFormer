@@ -24,6 +24,12 @@ class WiLoRViTConfig:
     sum_geo_gate_init: float = 4.0
     # For sum+channel_concat, zero-init the last projection layer so x_fused starts from pure RGB features.
     fusion_proj_zero_init: bool = True
+    # Explicit init mode for the last projection layer in channel_concat fusion.
+    # - "zero": exact zero init (restores the old RGB-safe start)
+    # - "small": near-zero init with immediate gate gradients
+    # - "default": keep PyTorch default init
+    # Empty string defers to fusion_proj_zero_init for backward-compatible config behavior.
+    fusion_proj_init_mode: str = ""
     # Cross-attention fusion settings
     cross_attn_num_heads: int = 8
     cross_attn_dropout: float = 0.0
@@ -92,13 +98,26 @@ class WiLoRViTWithGeo(nn.Module):
                     nn.GELU(),
                     nn.Linear(embed_dim, embed_dim)
                 )
-                if bool(getattr(cfg, "fusion_proj_zero_init", True)):
-                    last = self.fusion_proj[-1]
-                    if isinstance(last, nn.Linear):
+                last = self.fusion_proj[-1]
+                init_mode = str(getattr(cfg, "fusion_proj_init_mode", "")).strip().lower()
+                if not init_mode:
+                    init_mode = "zero" if bool(getattr(cfg, "fusion_proj_zero_init", True)) else "default"
+                if init_mode not in {"small", "zero", "default"}:
+                    raise ValueError(f"Unsupported fusion_proj_init_mode: {init_mode}")
+                if isinstance(last, nn.Linear):
+                    if init_mode == "small":
+                        # Preserve the current-code near-identity start while allowing the gate to move immediately.
+                        nn.init.normal_(last.weight, mean=0.0, std=1e-3)
+                        if last.bias is not None:
+                            nn.init.zeros_(last.bias)
+                        print("[WiLoRViTWithGeo] channel_concat Proj last layer small-init enabled")
+                    elif init_mode == "zero":
                         nn.init.zeros_(last.weight)
                         if last.bias is not None:
                             nn.init.zeros_(last.bias)
-                    print("[WiLoRViTWithGeo] channel_concat Proj last layer zero-init enabled")
+                        print("[WiLoRViTWithGeo] channel_concat Proj last layer zero-init enabled")
+                    else:
+                        print("[WiLoRViTWithGeo] channel_concat Proj last layer default-init enabled")
 
         # Cross-attention fusion: Query=RGB, Key/Value=Geo
         if self.token_fusion_mode == "cross_attn":

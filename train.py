@@ -4,11 +4,13 @@ import argparse
 import math
 import os
 import os.path as osp
+import random
 import sys
 import time
 from pathlib import Path
-from typing import Dict
+from typing import Any, Dict, Mapping
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -53,6 +55,14 @@ def _file_rank_sync(out_dir: Path, run_id: str, epoch: int, is_main: bool, timeo
     _wait_for_path(flag, timeout_s=timeout_s, poll_s=1.0)
 
 
+def _seed_worker(worker_id: int) -> None:
+    # Mirror the DataLoader's worker seed into python/numpy RNGs so that
+    # augmentation randomness remains reproducible across reruns.
+    worker_seed = torch.initial_seed() % (2**32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+
 def build_dataset(cfg: dict, split: str):
     name = cfg["dataset"]["name"].lower()
     align_wilor_aug = bool(cfg["dataset"].get("align_wilor_aug", True))
@@ -77,72 +87,9 @@ def build_dataset(cfg: dict, split: str):
         )
 
     if name in ("ho3d",):
-        use_ho3d_json = bool(cfg["dataset"].get("ho3d_use_json_split", False))
-        ho3d_train_json = str(cfg["paths"].get("ho3d_train_json", "")).strip()
-        ho3d_test_json = str(cfg["paths"].get("ho3d_test_json", "")).strip()
-
-        # NOTE:
-        # HO3D v3 "evaluation/test" split does NOT include full 21-joint GT (often only root joint),
-        # which makes PA-MPJPE ill-defined (GT variance ~ 0). For training-time validation we default
-        # to a split with GT available (train/train_all) unless overridden.
-        ho3d_val_split = str(cfg["dataset"].get("ho3d_val_split", "val")).lower()
-        if split != "train" and ho3d_val_split == "train_all":
-            # HO3D_v3 in this repo expects a list file named "<split>.txt".
-            # By default only train.txt / evaluation.txt exist, so treat train_all as train.
-            ho3d_val_split = "train"
-        if split != "train" and ho3d_val_split in ("evaluation", "test"):
-            if is_main_process():
-                print(
-                    f"[warn] HO3D val split is '{ho3d_val_split}', which may not contain full GT joints; "
-                    f"PA-MPJPE can be 0. Consider setting dataset.ho3d_val_split: train"
-                )
-
-        if use_ho3d_json:
-            json_split = "train" if split == "train" else ho3d_val_split
-            if json_split in ("train", "val", "train_all"):
-                required_json = ho3d_train_json
-                required_json_key = "paths.ho3d_train_json"
-            else:
-                required_json = ho3d_test_json
-                required_json_key = "paths.ho3d_test_json"
-
-            config_hint = str(cfg.get("__config_path__", "<unknown>"))
-            if not required_json:
-                raise FileNotFoundError(
-                    f"dataset.name=ho3d with dataset.ho3d_use_json_split=true, "
-                    f"but {required_json_key} is empty for split '{json_split}'. "
-                    f"config={config_hint}"
-                )
-            if not osp.exists(required_json):
-                raise FileNotFoundError(
-                    f"dataset.name=ho3d with dataset.ho3d_use_json_split=true, "
-                    f"but {required_json_key} does not exist: {required_json}. "
-                    f"split='{json_split}', config={config_hint}"
-                )
-
-            from data.ho3d_json_dataset import HO3DJsonDataset
-            return HO3DJsonDataset(
-                data_split=("train" if split == "train" else ho3d_val_split),
-                root_dir=cfg["paths"]["ho3d_root"],
-                train_json_path=ho3d_train_json,
-                test_json_path=ho3d_test_json,
-                img_size=int(cfg["dataset"].get("img_size", 256)),
-                train=(split == "train"),
-                align_wilor_aug=align_wilor_aug,
-                wilor_aug_config=cfg["dataset"].get("wilor_aug_config", {}),
-                bbox_source=bbox_source,
-                detector_weights_path=detector_path,
-                trainval_ratio=float(cfg["dataset"].get("ho3d_trainval_ratio", 0.9)),
-                trainval_seed=int(cfg["dataset"].get("ho3d_trainval_seed", 42)),
-                trainval_split_by=str(cfg["dataset"].get("ho3d_trainval_split_by", "sequence")),
-                root_index=root_index,
-                json_kp3d_unit=str(cfg["dataset"].get("ho3d_json_kp3d_unit", "auto")),
-                json_kp3d_scale=float(cfg["dataset"].get("ho3d_json_kp3d_scale", 1.0)),
-                json_convert_xyz=bool(cfg["dataset"].get("ho3d_json_convert_xyz", False)),
-            )
         from data.ho3d_dataset import HO3DDataset
         return HO3DDataset(
-            data_split=("train" if split == "train" else ho3d_val_split),
+            data_split=("train" if split == "train" else "evaluation"),
             root_dir=cfg["paths"]["ho3d_root"],
             dataset_version=cfg["dataset"].get("ho3d_version", "v3"),
             img_size=int(cfg["dataset"].get("img_size", 256)),
@@ -152,9 +99,10 @@ def build_dataset(cfg: dict, split: str):
             wilor_aug_config=cfg["dataset"].get("wilor_aug_config", {}),
             bbox_source=bbox_source,
             detector_weights_path=detector_path,
-            trainval_ratio=float(cfg["dataset"].get("ho3d_trainval_ratio", 0.9)),
-            trainval_seed=int(cfg["dataset"].get("ho3d_trainval_seed", 42)),
-            trainval_split_by=str(cfg["dataset"].get("ho3d_trainval_split_by", "sequence")),
+            train_split_file=str(cfg["paths"].get("ho3d_train_split_file", osp.join(cfg["paths"]["ho3d_root"], "train.txt"))),
+            eval_split_file=str(cfg["paths"].get("ho3d_eval_split_file", osp.join(cfg["paths"]["ho3d_root"], "evaluation.txt"))),
+            eval_xyz_json=str(cfg["paths"].get("ho3d_eval_xyz_json", osp.join(cfg["paths"]["ho3d_root"], "evaluation_xyz.json"))),
+            eval_verts_json=str(cfg["paths"].get("ho3d_eval_verts_json", osp.join(cfg["paths"]["ho3d_root"], "evaluation_verts.json"))),
             root_index=root_index,
         )
 
@@ -404,6 +352,8 @@ def evaluate_epoch(
             "PA-MPJPE_mm": float("nan"),
             "MPVPE_mm": float("nan"),
             "PA-MPVPE_mm": float("nan"),
+            "num_samples": 0,
+            "num_vert_samples": 0,
         }
     mpjpe_m = float(mpjpe_sum.item()) / n_val
     pampjpe_m = float(pampjpe_sum.item()) / n_val
@@ -419,6 +369,94 @@ def evaluate_epoch(
         "PA-MPJPE_mm": pampjpe_m * 1000.0,
         "MPVPE_mm": mpvpe_m * 1000.0 if math.isfinite(mpvpe_m) else float("nan"),
         "PA-MPVPE_mm": pampvpe_m * 1000.0 if math.isfinite(pampvpe_m) else float("nan"),
+        "num_samples": int(round(n_val)),
+        "num_vert_samples": int(round(n_vert_val)),
+    }
+
+
+def evaluate_loaders(
+    model: torch.nn.Module,
+    val_loader: DataLoader | Mapping[str, DataLoader],
+    device: torch.device,
+    image_size: int,
+    distributed: bool,
+    dist_info: DistInfo,
+    root_index: int = 9,
+) -> dict[str, Any]:
+    """
+    Evaluate either a single validation loader or a mapping of domain-specific loaders.
+
+    When multiple loaders are provided, we report per-domain metrics and a sample-count-weighted
+    aggregate. This makes mixed-dataset training able to select checkpoints using the whole mixed
+    test protocol instead of being silently anchored to a single primary domain.
+    """
+
+    if isinstance(val_loader, Mapping):
+        per_dataset: dict[str, dict[str, Any]] = {}
+        total_samples = 0
+        total_vert_samples = 0
+        weighted_sums = {
+            "MPJPE_mm": 0.0,
+            "PA-MPJPE_mm": 0.0,
+            "MPVPE_mm": 0.0,
+            "PA-MPVPE_mm": 0.0,
+        }
+
+        for dataset_name, loader in val_loader.items():
+            metrics = evaluate_epoch(
+                model,
+                loader,
+                device,
+                image_size,
+                distributed,
+                dist_info,
+                root_index=root_index,
+            )
+            per_dataset[str(dataset_name)] = metrics
+
+            n_samples = int(metrics.get("num_samples", 0))
+            n_vert = int(metrics.get("num_vert_samples", 0))
+            total_samples += n_samples
+            total_vert_samples += n_vert
+
+            if n_samples > 0:
+                for key in ("MPJPE_mm", "PA-MPJPE_mm"):
+                    value = float(metrics.get(key, float("nan")))
+                    if math.isfinite(value):
+                        weighted_sums[key] += value * n_samples
+            if n_vert > 0:
+                for key in ("MPVPE_mm", "PA-MPVPE_mm"):
+                    value = float(metrics.get(key, float("nan")))
+                    if math.isfinite(value):
+                        weighted_sums[key] += value * n_vert
+
+        aggregate = {
+            "MPJPE_mm": (weighted_sums["MPJPE_mm"] / total_samples) if total_samples > 0 else float("nan"),
+            "PA-MPJPE_mm": (weighted_sums["PA-MPJPE_mm"] / total_samples) if total_samples > 0 else float("nan"),
+            "MPVPE_mm": (weighted_sums["MPVPE_mm"] / total_vert_samples) if total_vert_samples > 0 else float("nan"),
+            "PA-MPVPE_mm": (weighted_sums["PA-MPVPE_mm"] / total_vert_samples) if total_vert_samples > 0 else float("nan"),
+            "num_samples": total_samples,
+            "num_vert_samples": total_vert_samples,
+        }
+        return {
+            "aggregate": aggregate,
+            "per_dataset": per_dataset,
+            "is_multi_dataset": True,
+        }
+
+    metrics = evaluate_epoch(
+        model,
+        val_loader,
+        device,
+        image_size,
+        distributed,
+        dist_info,
+        root_index=root_index,
+    )
+    return {
+        "aggregate": metrics,
+        "per_dataset": None,
+        "is_multi_dataset": False,
     }
 
 
@@ -452,8 +490,8 @@ def main():
     distributed = dist_info.distributed
     if is_main_process():
         dataset_name = str(cfg.get("dataset", {}).get("name", ""))
-        ho3d_json_flag = bool(cfg.get("dataset", {}).get("ho3d_use_json_split", False))
-        print(f"[info] config={config_path} dataset.name={dataset_name} ho3d_use_json_split={ho3d_json_flag}")
+        print(f"[info] train_script={Path(__file__).resolve()}")
+        print(f"[info] config={config_path} dataset.name={dataset_name}")
         moge2_output = str(cfg.get("model", {}).get("moge2_output", "neck"))
         use_geo_prior = bool(cfg.get("model", {}).get("use_geo_prior", True))
         print(f"[info] use_geo_prior={use_geo_prior} moge2_output={moge2_output} moge2_num_tokens={moge2_num_tokens}")
@@ -464,8 +502,15 @@ def main():
     else:
         device = dist_info.device if distributed else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Seed per-rank for determinism-ish
-    seed_everything(int(cfg["train"].get("seed", 42)), rank=(dist_info.rank if distributed else 0))
+    train_seed = int(cfg["train"].get("seed", 42))
+    deterministic_train = bool(cfg["train"].get("deterministic", False))
+
+    # Seed per-rank and optionally switch PyTorch/CuDNN into deterministic mode.
+    seed_everything(
+        train_seed,
+        rank=(dist_info.rank if distributed else 0),
+        deterministic=deterministic_train,
+    )
 
     try:
         # Build datasets
@@ -494,14 +539,20 @@ def main():
                 drop_last=False,
             )
 
+        req_train_workers = int(cfg["train"].get("num_workers", 4))
+        loader_generator = torch.Generator()
+        loader_generator.manual_seed(train_seed + (dist_info.rank if distributed else 0))
+
         train_loader = DataLoader(
             train_ds,
             batch_size=int(cfg["train"]["batch_size"]),
             shuffle=(train_sampler is None),
             sampler=train_sampler,
-            num_workers=int(cfg["train"].get("num_workers", 4)),
+            num_workers=req_train_workers,
             pin_memory=True,
             drop_last=distributed,  # keep all ranks aligned
+            worker_init_fn=(_seed_worker if req_train_workers > 0 else None),
+            generator=loader_generator,
         )
         val_loader = DataLoader(
             val_ds,
@@ -523,6 +574,8 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
     """Reusable training core: model build, loss, optimizer, train/eval loop."""
     root_index = int(cfg.get("dataset", {}).get("root_index", 9))
     moge2_num_tokens = int(cfg.get("model", {}).get("moge2_num_tokens", 400))
+    side_tuning_cfg = cfg.get("model", {}).get("side_tuning", {})
+    geo_side_adapter_cfg = cfg.get("model", {}).get("geo_side_adapter", {})
 
     # Model
     backbone_type = str(cfg["model"].get("backbone_type", "wilor"))
@@ -558,15 +611,21 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
             sum_fusion_strategy=str(cfg["model"].get("sum_fusion_strategy", "basic")),
             sum_geo_gate_init=float(cfg["model"].get("sum_geo_gate_init", 4.0)),
             fusion_proj_zero_init=bool(cfg["model"].get("fusion_proj_zero_init", True)),
+            fusion_proj_init_mode=str(cfg["model"].get("fusion_proj_init_mode", "")),
             cross_attn_num_heads=int(cfg["model"].get("cross_attn_num_heads", 8)),
             cross_attn_dropout=float(cfg["model"].get("cross_attn_dropout", 0.0)),
             cross_attn_gate_init=float(cfg["model"].get("cross_attn_gate_init", 0.0)),
             geo_tokenizer_use_pooling=bool(cfg["model"].get("geo_tokenizer_use_pooling", True)),
-            use_geo_side_tuning=bool(cfg["model"].get("side_tuning", {}).get("enabled", False)),
-            geo_side_tuning_side_channels=int(cfg["model"].get("side_tuning", {}).get("side_channels", 256)),
-            geo_side_tuning_dropout=float(cfg["model"].get("side_tuning", {}).get("dropout", 0.1)),
-            geo_side_tuning_max_res_scale=float(cfg["model"].get("side_tuning", {}).get("max_res_scale", 0.1)),
-            geo_side_tuning_init_res_scale=float(cfg["model"].get("side_tuning", {}).get("init_res_scale", 1e-3)),
+            use_geo_side_tuning=bool(side_tuning_cfg.get("enabled", False)),
+            geo_side_tuning_side_channels=int(side_tuning_cfg.get("side_channels", 256)),
+            geo_side_tuning_dropout=float(side_tuning_cfg.get("dropout", 0.1)),
+            geo_side_tuning_max_res_scale=float(side_tuning_cfg.get("max_res_scale", 0.1)),
+            geo_side_tuning_init_res_scale=float(side_tuning_cfg.get("init_res_scale", 1e-3)),
+            use_geo_side_adapter=bool(geo_side_adapter_cfg.get("enabled", False)),
+            geo_side_adapter_side_channels=int(geo_side_adapter_cfg.get("side_channels", 256)),
+            geo_side_adapter_depth=int(geo_side_adapter_cfg.get("depth", 3)),
+            geo_side_adapter_dropout=float(geo_side_adapter_cfg.get("dropout", 0.05)),
+            geo_side_adapter_norm_groups=int(geo_side_adapter_cfg.get("norm_groups", 32)),
             geo_branch_dropout_prob=float(cfg["model"].get("geo_branch_dropout_prob", 0.0)),
             # Feature Refiner configuration
             feature_refiner_method=str(cfg["model"].get("feature_refiner", {}).get("method", "none")),
@@ -651,6 +710,7 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
     head_mult = float(lr_mult.get("head", 1.0))
     side_mult = float(lr_mult.get("side_tuning", 1.0))
     geo_fusion_mult = float(lr_mult.get("geo_fusion", 1.0))
+    gate_mult = float(lr_mult.get("gate", head_mult))
 
     # Build parameter groups with layered learning rates.
     # geo_fusion covers multimodal adapters outside encoder.backbone, e.g.:
@@ -674,16 +734,20 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
     def is_geo_fusion_param(name: str) -> bool:
         return any(name.startswith(prefix) for prefix in geo_fusion_prefixes)
 
-    backbone_params, head_params, side_params, geo_fusion_params, other_params = [], [], [], [], []
+    gate_param_names = {"encoder.sum_geo_gate", "encoder.cross_attn_gate"}
+
+    backbone_params, head_params, side_params, gate_params, geo_fusion_params, other_params = [], [], [], [], [], []
     raw_model = model.module if hasattr(model, "module") else model
     for name, p in raw_model.named_parameters():
         if not p.requires_grad:
             continue
         if name.startswith("encoder.backbone."):
             backbone_params.append(p)
+        elif name in gate_param_names:
+            gate_params.append(p)
         elif name.startswith("mano_head.") or name.startswith("feature_refiner."):
             head_params.append(p)
-        elif name.startswith("geo_side_tuning."):
+        elif name.startswith("geo_side_tuning.") or name.startswith("geo_side_adapter."):
             side_params.append(p)
         elif is_geo_fusion_param(name):
             geo_fusion_params.append(p)
@@ -695,6 +759,9 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
         {"params": head_params, "lr": base_lr * head_mult},
     ]
     param_group_names = ["backbone", "head"]
+    if gate_params:
+        param_groups.append({"params": gate_params, "lr": base_lr * gate_mult})
+        param_group_names.append("gate")
     if geo_fusion_params:
         param_groups.append({"params": geo_fusion_params, "lr": base_lr * geo_fusion_mult})
         param_group_names.append("geo_fusion")
@@ -708,6 +775,8 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
             f"backbone lr={base_lr * backbone_mult:.1e} ({len(backbone_params)} tensors)",
             f"head lr={base_lr * head_mult:.1e} ({len(head_params)} tensors)",
         ]
+        if gate_params:
+            stats.append(f"gate lr={base_lr * gate_mult:.1e} ({len(gate_params)} tensors)")
         if geo_fusion_params:
             stats.append(f"geo_fusion lr={base_lr * geo_fusion_mult:.1e} ({len(geo_fusion_params)} tensors)")
         if side_params:
@@ -807,17 +876,17 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
 
     lr_lambdas = []
     for name in param_group_names:
-        if name == "geo_fusion":
+        if name in ("geo_fusion", "gate"):
             lr_lambdas.append(lambda step: lr_lambda(step) * geo_ramp_factor(step))
         elif name == "side_tuning":
             lr_lambdas.append(lambda step: lr_lambda(step) * side_ramp_factor(step))
         else:
             lr_lambdas.append(lr_lambda)
     scheduler = LambdaLR(optimizer, lr_lambda=lr_lambdas)
-    if is_main_process() and "geo_fusion" in param_group_names:
+    if is_main_process() and any(name in param_group_names for name in ("geo_fusion", "gate")):
         ramp_epochs_float = float(geo_ramp_steps) / float(max(steps_per_epoch, 1))
         print(
-            f"[sched] geo_fusion_start_factor={geo_start_factor:.3f}, "
+            f"[sched] geo_fusion/gate_start_factor={geo_start_factor:.3f}, "
             f"geo_fusion_ramp_steps={geo_ramp_steps} ({ramp_epochs_float:.2f} epochs)"
         )
     if is_main_process() and "side_tuning" in param_group_names:
@@ -1336,7 +1405,7 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
             torch.cuda.empty_cache()
         # Use EMA model for evaluation if available
         eval_model = model_ema.module() if model_ema is not None else model
-        val_metrics = evaluate_epoch(
+        val_eval = evaluate_loaders(
             eval_model,
             val_loader,
             device,
@@ -1345,14 +1414,26 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
             dist_info,
             root_index=root_index,
         )
+        val_metrics = val_eval["aggregate"]
         if is_main_process():
             ema_tag = " (EMA)" if model_ema is not None else ""
+            if val_eval.get("is_multi_dataset", False):
+                for dataset_name, ds_metrics in val_eval.get("per_dataset", {}).items():
+                    print(
+                        f"[epoch {epoch}] val[{dataset_name}]{ema_tag} "
+                        f"MPJPE(mm)={float(ds_metrics['MPJPE_mm']):.3f}  "
+                        f"PA-MPJPE(mm)={float(ds_metrics['PA-MPJPE_mm']):.3f}  "
+                        f"MPVPE(mm)={float(ds_metrics['MPVPE_mm']):.3f}  "
+                        f"PA-MPVPE(mm)={float(ds_metrics['PA-MPVPE_mm']):.3f}  "
+                        f"n={int(ds_metrics.get('num_samples', 0))}"
+                    )
             mpjpe_mm = float(val_metrics["MPJPE_mm"])
             pampjpe_mm = float(val_metrics["PA-MPJPE_mm"])
             mpvpe_mm = float(val_metrics["MPVPE_mm"])
             pampvpe_mm = float(val_metrics["PA-MPVPE_mm"])
+            val_label = "val(mixed)" if val_eval.get("is_multi_dataset", False) else "val"
             print(
-                f"[epoch {epoch}] val{ema_tag} MPJPE(mm)={mpjpe_mm:.3f}  "
+                f"[epoch {epoch}] {val_label}{ema_tag} MPJPE(mm)={mpjpe_mm:.3f}  "
                 f"PA-MPJPE(mm)={pampjpe_mm:.3f}  "
                 f"MPVPE(mm)={mpvpe_mm:.3f}  "
                 f"PA-MPVPE(mm)={pampvpe_mm:.3f}"
@@ -1397,6 +1478,8 @@ def train_loop(cfg, train_loader, val_loader, train_sampler, dist_info, distribu
                     "best_ckpt_metric": best_ckpt_metric,
                     "best_ckpt_score": best_ckpt_score,
                 }
+                if val_eval.get("is_multi_dataset", False):
+                    checkpoint["val_multi_dataset"] = val_eval
 
                 # Save EMA model state if available
                 if model_ema is not None:

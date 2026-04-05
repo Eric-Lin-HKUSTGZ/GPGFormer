@@ -17,6 +17,7 @@ from gpgformer.models.heads.mano_head import MANOHeadConfig, MANOTransformerDeco
 from gpgformer.models.heads.feature_refiner import FeatureRefinerConfig, build_feature_refiner
 from gpgformer.models.mano.mano_layer import MANOConfig, MANOLayer
 from gpgformer.models.priors.moge2 import MoGe2Config, MoGe2Prior
+from gpgformer.models.tokenizers.geo_side_adapter import GeoSideAdapter
 from gpgformer.models.tokenizers.geo_tokenizer import GeoTokenizer, CoordPosEmbed
 from gpgformer.models.tokenizers.geo_side_tuning import GeoSideTuning
 
@@ -55,6 +56,7 @@ class GPGFormerConfig:
     # Learnable scalar gate for geometry injection in sum mode; effective gate is sigmoid(param).
     sum_geo_gate_init: float = 4.0
     fusion_proj_zero_init: bool = True
+    fusion_proj_init_mode: str = ""
     # Cross-attention fusion settings (only used when token_fusion_mode="cross_attn")
     cross_attn_num_heads: int = 8
     cross_attn_dropout: float = 0.0
@@ -67,6 +69,12 @@ class GPGFormerConfig:
     geo_side_tuning_dropout: float = 0.1
     geo_side_tuning_max_res_scale: float = 0.1
     geo_side_tuning_init_res_scale: float = 1e-3
+    # Optional HandOS-style side adapter on MoGe2 neck feature maps (applied before GeoTokenizer).
+    use_geo_side_adapter: bool = False
+    geo_side_adapter_side_channels: int = 256
+    geo_side_adapter_depth: int = 3
+    geo_side_adapter_dropout: float = 0.05
+    geo_side_adapter_norm_groups: int = 32
     # Modality dropout for geometry tokens during training (0 disables).
     geo_branch_dropout_prob: float = 0.0
 
@@ -136,6 +144,14 @@ class GPGFormer(nn.Module):
         # Geo tokenizer: in_channels depends on MoGe2 neck config; infer lazily at first forward.
         self.geo_tokenizer: GeoTokenizer | None = None
         self.geo_pos: CoordPosEmbed | None = CoordPosEmbed(embed_dim=1280) if self.use_geo_prior else None
+        self.geo_side_adapter: GeoSideAdapter | None = None
+        if self.use_geo_prior and bool(getattr(cfg, "use_geo_side_adapter", False)):
+            self.geo_side_adapter = GeoSideAdapter(
+                side_channels=int(getattr(cfg, "geo_side_adapter_side_channels", 256)),
+                depth=int(getattr(cfg, "geo_side_adapter_depth", 3)),
+                dropout=float(getattr(cfg, "geo_side_adapter_dropout", 0.05)),
+                norm_groups=int(getattr(cfg, "geo_side_adapter_norm_groups", 32)),
+            )
         self.geo_side_tuning: GeoSideTuning | None = None
         if self.use_geo_prior and bool(getattr(cfg, "use_geo_side_tuning", False)):
             self.geo_side_tuning = GeoSideTuning(
@@ -158,6 +174,7 @@ class GPGFormer(nn.Module):
                     sum_fusion_strategy=getattr(cfg, 'sum_fusion_strategy', 'basic'),
                     sum_geo_gate_init=float(getattr(cfg, "sum_geo_gate_init", 4.0)),
                     fusion_proj_zero_init=bool(getattr(cfg, "fusion_proj_zero_init", True)),
+                    fusion_proj_init_mode=str(getattr(cfg, "fusion_proj_init_mode", "")),
                     cross_attn_num_heads=getattr(cfg, 'cross_attn_num_heads', 8),
                     cross_attn_dropout=getattr(cfg, 'cross_attn_dropout', 0.0),
                     cross_attn_gate_init=getattr(cfg, 'cross_attn_gate_init', 0.0),
@@ -174,6 +191,7 @@ class GPGFormer(nn.Module):
                     sum_fusion_strategy=getattr(cfg, 'sum_fusion_strategy', 'basic'),
                     sum_geo_gate_init=float(getattr(cfg, "sum_geo_gate_init", 4.0)),
                     fusion_proj_zero_init=bool(getattr(cfg, "fusion_proj_zero_init", True)),
+                    fusion_proj_init_mode=str(getattr(cfg, "fusion_proj_init_mode", "")),
                     cross_attn_num_heads=getattr(cfg, 'cross_attn_num_heads', 8),
                     cross_attn_dropout=getattr(cfg, 'cross_attn_dropout', 0.0),
                     cross_attn_gate_init=getattr(cfg, 'cross_attn_gate_init', 0.0),
@@ -386,6 +404,8 @@ class GPGFormer(nn.Module):
             geo_feat = self.moge2(img_moge)  # (B,Cg,Hg,Wg)
             # MoGe2Prior runs under inference_mode; clone to make it a normal tensor usable by autograd modules.
             geo_feat = geo_feat.clone()
+            if self.geo_side_adapter is not None:
+                geo_feat = self.geo_side_adapter(geo_feat)
             self._init_geo_tokenizer_if_needed(geo_feat)
             assert self.geo_tokenizer is not None
 

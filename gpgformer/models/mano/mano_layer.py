@@ -16,6 +16,7 @@ class MANOConfig:
     mean_params: str
     gender: str = "neutral"
     num_hand_joints: int = 15
+    is_rhand: bool = True
 
 
 class MANOLayer(nn.Module):
@@ -31,7 +32,7 @@ class MANOLayer(nn.Module):
         # WiLoR's MANO wrapper expects smplx MANO assets in model_path
         self.mano = MANO(
             model_path=str(model_path),
-            is_rhand=True,
+            is_rhand=bool(cfg.is_rhand),
             use_pca=False,
             flat_hand_mean=False,
             num_pca_comps=0,
@@ -51,5 +52,4 @@ class MANOLayer(nn.Module):
             betas=mano_params["betas"],
             pose2rot=pose2rot,
         )
-
 
