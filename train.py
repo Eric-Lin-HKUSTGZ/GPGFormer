@@ -137,6 +137,8 @@ def build_dataset(cfg: dict, split: str):
             trainval_ratio=float(cfg["dataset"].get("trainval_ratio", 0.9)),
             trainval_seed=int(cfg["dataset"].get("trainval_seed", 42)),
             use_trainval_split=bool(cfg["dataset"].get("use_trainval_split", True)),
+            load_vertices_gt=bool(cfg["dataset"].get("load_vertices_gt", True)),
+            load_vertices_gt_train=bool(cfg["dataset"].get("load_vertices_gt_train", False)),
         )
 
     raise ValueError(f"Unknown dataset.name: {cfg['dataset']['name']}")

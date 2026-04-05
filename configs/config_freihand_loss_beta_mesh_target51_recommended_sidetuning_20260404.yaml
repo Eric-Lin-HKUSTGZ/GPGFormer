@@ -3,6 +3,8 @@ dataset:
   img_size: 256
   root_index: 9
   use_trainval_split: false
+  load_vertices_gt: true
+  load_vertices_gt_train: false
   trainval_ratio: 0.9
   trainval_seed: 42
   align_wilor_aug: true
@@ -121,8 +123,8 @@ loss:
     - [19, 20]
   # Keep the mesh term from currentcode, which improved both PA metrics on the current branch.
   w_3d_vert: 0.10
-  w_global_orient: 1.0
-  w_hand_pose: 1.0
+  w_global_orient: 0.1
+  w_hand_pose: 0.1
   w_scale: 0.0
   # Restore part of the shape regularization lost in currentcode while keeping a light beta anchor.
   w_betas: 0.01

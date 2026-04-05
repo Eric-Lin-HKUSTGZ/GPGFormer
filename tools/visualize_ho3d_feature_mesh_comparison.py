@@ -40,8 +40,9 @@ IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 
 DEFAULT_MULTIMODAL_CKPTS = {
     "ho3d": "/root/code/vepfs/GPGFormer/checkpoints/ablations_v2/mixed_ho3d_20260320/ho3d/gpgformer_best.pt",
     "freihand": (
-        "/root/code/vepfs/GPGFormer/checkpoints/"
-        "freihand_loss_beta_mesh_target51_recommended_sidetuning_20260317/freihand/gpgformer_best.pt"
+        # "/root/code/vepfs/GPGFormer/checkpoints/"
+        # "freihand_loss_beta_mesh_target51_recommended_sidetuning_20260317/freihand/gpgformer_best.pt"
+        "/root/code/vepfs/GPGFormer/checkpoints/freihand_loss_beta_mesh_target51_recommended_sidetuning_20260404/freihand/gpgformer_best.pt"
     ),
 }
 DEFAULT_RGB_CKPTS = {

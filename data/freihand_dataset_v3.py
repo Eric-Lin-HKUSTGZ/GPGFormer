@@ -50,6 +50,7 @@ class FreiHANDDatasetV3(Dataset):
                  trainval_seed: int = 42,
                  use_trainval_split: bool = True,
                  load_vertices_gt: bool = True,
+                 load_vertices_gt_train: bool = False,
                  # New augmentation parameters
                  center_jitter_factor: float = 0.05,
                  brightness_limit: tuple = (-0.2, 0.1),
@@ -79,6 +80,7 @@ class FreiHANDDatasetV3(Dataset):
         self.trainval_seed = int(trainval_seed)
         self.use_trainval_split = bool(use_trainval_split)
         self.load_vertices_gt = bool(load_vertices_gt)
+        self.load_vertices_gt_train = bool(load_vertices_gt_train)
 
         if isinstance(cube_size, (list, tuple, np.ndarray)):
             self.cube_size = list(cube_size)
@@ -136,7 +138,11 @@ class FreiHANDDatasetV3(Dataset):
         self.mano_list = _load_json(mano_path)
         self.xyz_list = _load_json(xyz_path)
         self.verts_list = None
-        if self.load_vertices_gt and osp.isfile(verts_path):
+        # FreiHAND official vertices are not perfectly consistent with the current
+        # WiLoR/smplx MANO decoder. During training we therefore default to
+        # parameter-consistent mesh supervision (decoded from GT MANO params)
+        # and reserve official verts_gt for evaluation/debug unless explicitly enabled.
+        if self.load_vertices_gt and osp.isfile(verts_path) and ((not self.train) or self.load_vertices_gt_train):
             self.verts_list = _load_json(verts_path)
 
         if not (len(self.K_list) == len(self.mano_list) == len(self.xyz_list)):
